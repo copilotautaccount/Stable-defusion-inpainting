@@ -94,6 +94,34 @@ def _image_paths(images_dir: Path) -> List[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Transformers version helpers
+# ---------------------------------------------------------------------------
+
+def _transformers_version() -> tuple:
+    """Return the installed ``transformers`` version as a ``(major, minor)`` tuple.
+
+    Falls back to ``(0, 0)`` if the package is not importable (e.g. in tests).
+    """
+    try:
+        import transformers as _tf
+        parts = _tf.__version__.split(".")
+        return (int(parts[0]), int(parts[1]))
+    except Exception:
+        return (0, 0)
+
+
+def _torch_dtype_kwarg(dtype) -> dict:
+    """Return the correct kwarg for specifying dtype when loading a HuggingFace model.
+
+    * ``transformers < 4.48`` – uses the original ``torch_dtype`` parameter.
+    * ``transformers >= 4.48`` – ``torch_dtype`` is deprecated; use ``dtype``.
+    """
+    if _transformers_version() >= (4, 48):
+        return {"dtype": dtype}
+    return {"torch_dtype": dtype}
+
+
+# ---------------------------------------------------------------------------
 # Split raw images into train / val
 # ---------------------------------------------------------------------------
 
@@ -163,7 +191,7 @@ def _caption_blip(
     processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
     model = BlipForConditionalGeneration.from_pretrained(
         "Salesforce/blip-image-captioning-large",
-        torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+        **_torch_dtype_kwarg(torch.float16 if device != "cpu" else torch.float32),
     ).to(device)
     model.eval()
 
@@ -202,7 +230,7 @@ def _caption_blip2(
     processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
     model = Blip2ForConditionalGeneration.from_pretrained(
         "Salesforce/blip2-opt-2.7b",
-        torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+        **_torch_dtype_kwarg(torch.float16 if device != "cpu" else torch.float32),
         device_map=device,
     )
     model.eval()
@@ -232,6 +260,19 @@ def _caption_florence2(
     ~8 GB VRAM. Returns dense, region-aware captions – well-suited for
     interior scenes where multiple furniture objects need to be described.
     Uses the ``<MORE_DETAILED_CAPTION>`` task token for richer output.
+
+    Compatibility note
+    ------------------
+    * ``transformers < 4.45`` – Florence-2 requires ``trust_remote_code=True``.
+    * ``transformers >= 4.45`` – Florence-2 is natively supported; passing
+      ``trust_remote_code=True`` causes an architecture mismatch (the custom
+      remote code references an old class that conflicts with the built-in one),
+      producing the "model of type florence2 to instantiate model of type ``"
+      error.  ``trust_remote_code`` must therefore be omitted on these versions.
+    * ``transformers >= 4.48`` – ``torch_dtype`` is deprecated; use ``dtype``.
+
+    The loading logic below detects the installed version and selects the
+    correct kwargs automatically.
     """
     try:
         import torch
@@ -241,12 +282,20 @@ def _caption_florence2(
 
     model_id = "microsoft/Florence-2-large"
     print(f"Loading Florence-2 processor and model ({model_id}) …")
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+
+    _dtype = torch.float16 if device != "cpu" else torch.float32
+    # transformers >= 4.45: native Florence-2 support; trust_remote_code must
+    # NOT be passed (it causes an architecture-class mismatch and a crash).
+    _native_florence2: bool = _transformers_version() >= (4, 45)
+
+    processor = AutoProcessor.from_pretrained(
         model_id,
-        torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-        trust_remote_code=True,
-    ).to(device)
+        trust_remote_code=not _native_florence2,
+    )
+    model_kwargs = _torch_dtype_kwarg(_dtype)
+    if not _native_florence2:
+        model_kwargs["trust_remote_code"] = True
+    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs).to(device)
     model.eval()
 
     task_token = "<MORE_DETAILED_CAPTION>"
@@ -594,7 +643,7 @@ def _mask_oneformer(
     processor = AutoProcessor.from_pretrained(model_id)
     model = OneFormerForUniversalSegmentation.from_pretrained(
         model_id,
-        torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+        **_torch_dtype_kwarg(torch.float16 if device != "cpu" else torch.float32),
     ).to(device)
     model.eval()
 

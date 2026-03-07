@@ -25,6 +25,8 @@ import prepare_data as pd_mod
 from prepare_data import (
     _DEFAULT_FURNITURE_LABELS,
     _pick_best_mask,
+    _torch_dtype_kwarg,
+    _transformers_version,
     generate_captions,
     generate_masks,
     split_dataset,
@@ -438,3 +440,183 @@ class TestDefaults:
         labels_lower = _DEFAULT_FURNITURE_LABELS.lower()
         for item in ("sofa", "chair", "table", "bed", "lamp"):
             assert item in labels_lower, f"'{item}' missing from default labels"
+
+
+# ---------------------------------------------------------------------------
+# _transformers_version and _torch_dtype_kwarg helpers
+# ---------------------------------------------------------------------------
+
+class TestTransformersVersionHelper:
+    def test_returns_tuple(self):
+        ver = _transformers_version()
+        assert isinstance(ver, tuple)
+        assert len(ver) == 2
+        assert all(isinstance(x, int) for x in ver)
+
+    def test_returns_zero_zero_on_import_failure(self):
+        """When transformers is not importable the helper returns (0, 0)."""
+        import sys
+        with patch.dict(sys.modules, {"transformers": None}):
+            ver = _transformers_version()
+        assert ver == (0, 0)
+
+    def test_real_version_is_positive(self):
+        """The installed transformers should have a positive major version."""
+        ver = _transformers_version()
+        # transformers has been at major version 4 for a long time
+        assert ver[0] >= 4 or ver == (0, 0), (
+            "Expected major version >= 4 (or (0,0) fallback)"
+        )
+
+
+class TestTorchDtypeKwarg:
+    """Verify _torch_dtype_kwarg returns the correct key for the given version."""
+
+    def _patch_version(self, major: int, minor: int):
+        return patch("prepare_data._transformers_version", return_value=(major, minor))
+
+    def test_old_transformers_uses_torch_dtype(self):
+        import torch
+        with self._patch_version(4, 44):
+            kwarg = _torch_dtype_kwarg(torch.float16)
+        assert "torch_dtype" in kwarg
+        assert "dtype" not in kwarg
+        assert kwarg["torch_dtype"] == torch.float16
+
+    def test_new_transformers_uses_dtype(self):
+        import torch
+        with self._patch_version(4, 48):
+            kwarg = _torch_dtype_kwarg(torch.float16)
+        assert "dtype" in kwarg
+        assert "torch_dtype" not in kwarg
+        assert kwarg["dtype"] == torch.float16
+
+    def test_boundary_version_4_47_uses_torch_dtype(self):
+        """4.47 is still below the 4.48 threshold → torch_dtype."""
+        import torch
+        with self._patch_version(4, 47):
+            kwarg = _torch_dtype_kwarg(torch.float32)
+        assert "torch_dtype" in kwarg
+
+    def test_boundary_version_4_48_uses_dtype(self):
+        import torch
+        with self._patch_version(4, 48):
+            kwarg = _torch_dtype_kwarg(torch.float32)
+        assert "dtype" in kwarg
+
+
+# ---------------------------------------------------------------------------
+# Florence-2 version-aware loading path
+# ---------------------------------------------------------------------------
+
+class TestFlorence2Loading:
+    """Verify that _caption_florence2 passes the correct kwargs to
+    AutoModelForCausalLM.from_pretrained depending on the transformers version.
+
+    Strategy: patch sys.modules["transformers"] so the lazy-import inside
+    _caption_florence2 picks up our mock, then abort early (via StopIteration)
+    after loading to avoid having to simulate a full inference pass.
+    """
+
+    def _capture_model_kwargs(self, tf_version: tuple, tiny_dataset) -> dict:
+        """Return the kwargs that AutoModelForCausalLM.from_pretrained was
+        called with for the given simulated *tf_version*."""
+        import sys
+        captured: dict = {}
+
+        mock_processor_inst = MagicMock()
+        mock_processor_cls = MagicMock()
+        mock_processor_cls.from_pretrained.return_value = mock_processor_inst
+
+        def fake_model_from_pretrained(model_id, **kwargs):
+            captured.update(kwargs)
+            raise StopIteration("abort-after-load")  # skip inference
+
+        mock_model_cls = MagicMock()
+        mock_model_cls.from_pretrained.side_effect = fake_model_from_pretrained
+
+        fake_tf = MagicMock()
+        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoProcessor = mock_processor_cls
+
+        paths = _image_paths(tiny_dataset / "train" / "images")
+        with patch("prepare_data._transformers_version", return_value=tf_version), \
+             patch.dict(sys.modules, {"transformers": fake_tf}):
+            with pytest.raises(StopIteration):
+                pd_mod._caption_florence2(paths[:1], "cpu", batch_size=1)
+
+        return captured
+
+    def test_old_transformers_passes_trust_remote_code(self, tiny_dataset):
+        """transformers < 4.45 → trust_remote_code=True must be passed."""
+        kwargs = self._capture_model_kwargs((4, 44), tiny_dataset)
+        assert kwargs.get("trust_remote_code") is True
+
+    def test_new_transformers_omits_trust_remote_code(self, tiny_dataset):
+        """transformers >= 4.45 → trust_remote_code must NOT be in kwargs.
+
+        Passing it causes the 'model of type florence2 to instantiate model of
+        type ``' architecture-class mismatch crash.
+        """
+        kwargs = self._capture_model_kwargs((4, 45), tiny_dataset)
+        assert "trust_remote_code" not in kwargs
+
+    def test_new_transformers_uses_dtype_kwarg(self, tiny_dataset):
+        """transformers >= 4.48 → dtype kwarg, not torch_dtype."""
+        kwargs = self._capture_model_kwargs((4, 48), tiny_dataset)
+        assert "dtype" in kwargs
+        assert "torch_dtype" not in kwargs
+
+    def test_old_transformers_uses_torch_dtype_kwarg(self, tiny_dataset):
+        """transformers < 4.48 → torch_dtype kwarg (not yet deprecated)."""
+        kwargs = self._capture_model_kwargs((4, 44), tiny_dataset)
+        assert "torch_dtype" in kwargs
+        assert "dtype" not in kwargs
+
+    def test_processor_no_trust_remote_code_on_new_transformers(self, tiny_dataset):
+        """AutoProcessor.from_pretrained should be called WITHOUT
+        trust_remote_code on transformers >= 4.45."""
+        import sys
+
+        mock_processor_cls = MagicMock()
+        mock_processor_cls.from_pretrained.return_value = MagicMock()
+
+        mock_model_cls = MagicMock()
+        mock_model_cls.from_pretrained.side_effect = StopIteration("abort")
+
+        fake_tf = MagicMock()
+        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoProcessor = mock_processor_cls
+
+        paths = _image_paths(tiny_dataset / "train" / "images")
+        with patch("prepare_data._transformers_version", return_value=(4, 45)), \
+             patch.dict(sys.modules, {"transformers": fake_tf}):
+            with pytest.raises(StopIteration):
+                pd_mod._caption_florence2(paths[:1], "cpu", batch_size=1)
+
+        _, proc_kwargs = mock_processor_cls.from_pretrained.call_args
+        assert proc_kwargs.get("trust_remote_code") is not True
+
+    def test_processor_trust_remote_code_on_old_transformers(self, tiny_dataset):
+        """AutoProcessor.from_pretrained should be called WITH
+        trust_remote_code=True on transformers < 4.45."""
+        import sys
+
+        mock_processor_cls = MagicMock()
+        mock_processor_cls.from_pretrained.return_value = MagicMock()
+
+        mock_model_cls = MagicMock()
+        mock_model_cls.from_pretrained.side_effect = StopIteration("abort")
+
+        fake_tf = MagicMock()
+        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoProcessor = mock_processor_cls
+
+        paths = _image_paths(tiny_dataset / "train" / "images")
+        with patch("prepare_data._transformers_version", return_value=(4, 44)), \
+             patch.dict(sys.modules, {"transformers": fake_tf}):
+            with pytest.raises(StopIteration):
+                pd_mod._caption_florence2(paths[:1], "cpu", batch_size=1)
+
+        _, proc_kwargs = mock_processor_cls.from_pretrained.call_args
+        assert proc_kwargs.get("trust_remote_code") is True
