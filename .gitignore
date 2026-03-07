@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Pytest cache
+.pytest_cache/
+
+# Data & outputs (large files – track externally or with DVC)
+data/raw/
+data/interior/
+outputs/
+results/
+checkpoints/
+
+# Model weights
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Logs
+*.log
+wandb/
+runs/
+lightning_logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
