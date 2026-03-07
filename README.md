@@ -16,6 +16,8 @@ Fine-tune **Stable Diffusion Inpainting** on an interior-design dataset to intel
 8. [Configuration Reference](#configuration-reference)
 9. [Hardware Requirements](#hardware-requirements)
 10. [Recommended Datasets](#recommended-datasets)
+11. [Getting Updates](#getting-updates)
+12. [Running Tests](#running-tests)
 
 ---
 
@@ -542,6 +544,88 @@ For interior design inpainting, the following public datasets work well:
 | [Structured3D](https://structured3d-dataset.org/) | 196 500 | Photo-realistic panoramic rooms |
 | [SUN RGB-D](https://rgbd.cs.princeton.edu/) | 10 000+ | Real indoor RGBD images |
 | Scraped Pinterest/Houzz images | Custom | High-quality real-world interiors |
+
+---
+
+## Getting Updates
+
+This section explains how to pull the latest bug-fixes and improvements into
+a copy of the repository that you have already cloned on your server.
+
+### Scenario A – you cloned from `main` (the default)
+
+```bash
+cd /path/to/Stable-defusion-inpainting   # enter your local clone
+
+git fetch origin          # download all remote changes without touching your files
+git pull origin main      # merge the latest main branch into your local copy
+```
+
+### Scenario B – you want the Florence-2 fix branch specifically
+
+The fix for the `"model of type florence2 to instantiate model of type ``"` crash
+(and the `torch_dtype` deprecation warning) lives on the
+`copilot/fine-tune-stable-diffusion-inpainting` branch.
+
+#### Option 1 – switch to the fix branch directly
+
+```bash
+cd /path/to/Stable-defusion-inpainting
+
+git fetch origin
+git checkout copilot/fine-tune-stable-diffusion-inpainting
+```
+
+Everything in `src/prepare_data.py` now includes the fix.  Run as normal:
+
+```bash
+python src/prepare_data.py caption \
+    --dataset_dir data/interior \
+    --captioner   florence2 \
+    --device      cuda
+```
+
+#### Option 2 – cherry-pick just the fix commit into your current branch
+
+If you want to stay on your own branch but apply only the Florence-2 fix:
+
+```bash
+git fetch origin
+
+# The commit SHA for the Florence-2 fix:
+git cherry-pick fe4a26fbae0baed63c44b99d71904d66a2ec57e6
+```
+
+#### Option 3 – merge the fix branch into your working branch
+
+```bash
+git fetch origin
+git merge origin/copilot/fine-tune-stable-diffusion-inpainting
+```
+
+### Verifying the update was applied
+
+After updating, confirm the version-aware Florence-2 loader is present:
+
+```bash
+grep "_transformers_version" src/prepare_data.py
+# Should print two lines (the helper function definition and its call site)
+```
+
+Then run the test suite to make sure everything is healthy:
+
+```bash
+pip install pytest
+pytest tests/test_prepare_data.py -v
+# All tests should pass (54 passed)
+```
+
+### Keeping up with future changes
+
+```bash
+# Run this any time you want the latest version:
+git pull origin main
+```
 
 ---
 
