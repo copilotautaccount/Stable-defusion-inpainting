@@ -59,7 +59,8 @@ pip install -r requirements.txt
 ```
 Stable-defusion-inpainting/
 ├── configs/
-│   └── train_config.yaml      # All training hyper-parameters
+│   ├── train_config.yaml      # All training hyper-parameters
+│   └── annotation_config.yaml # Model options for captioning & masking
 ├── data/
 │   └── interior/              # Processed dataset (created by prepare_data.sh)
 │       ├── train/
@@ -111,6 +112,12 @@ bash scripts/train.sh
 
 ## Dataset Preparation
 
+Since the raw dataset contains **only images** (no masks and no captions), you
+must run the preparation pipeline below to annotate it before training.
+
+See [`configs/annotation_config.yaml`](configs/annotation_config.yaml) for a
+complete reference of all model options and their hardware requirements.
+
 ### Step 1 – Organise images
 
 Place all raw interior images into `data/raw/`. Any folder structure is supported.
@@ -131,18 +138,41 @@ python src/prepare_data.py split \
     --val_ratio  0.1
 ```
 
-### Step 3 – Auto-generate captions (recommended)
+---
 
-Uses **BLIP-2** (Salesforce/blip2-opt-2.7b) to generate interior-specific captions.
-Requires ~15 GB of GPU memory for the 2.7B model.
+### Step 3 – Generate captions
+
+Three captioning models are available. Choose based on your available GPU memory:
+
+| Model | Flag | HuggingFace ID | VRAM | Speed | Notes |
+|-------|------|----------------|------|-------|-------|
+| **BLIP** | `--captioner blip` | `Salesforce/blip-image-captioning-large` | ~6 GB | Fast | Good quality, no prefix |
+| **BLIP-2** | `--captioner blip2` | `Salesforce/blip2-opt-2.7b` | ~15 GB | Medium | Best quality, supports text prefix |
+| **Florence-2** | `--captioner florence2` | `microsoft/Florence-2-large` | ~8 GB | Fast | Dense region-aware captions – **recommended for complex scenes** |
+
+**Quick recommendation:**
+- ≤ 8 GB VRAM → use `blip` or `florence2`
+- ≥ 16 GB VRAM → use `blip2` for richer, longer captions
+- Multi-object / cluttered interiors → use `florence2`
 
 ```bash
+# Fast & memory-efficient
 python src/prepare_data.py caption \
     --dataset_dir data/interior \
-    --device      cuda
+    --captioner   blip
+
+# Best quality
+python src/prepare_data.py caption \
+    --dataset_dir data/interior \
+    --captioner   blip2
+
+# Detailed region-aware captions (recommended)
+python src/prepare_data.py caption \
+    --dataset_dir data/interior \
+    --captioner   florence2
 ```
 
-**Alternatively**, create `captions.json` manually:
+**Alternatively**, write `captions.json` manually:
 
 ```json
 {
@@ -151,28 +181,80 @@ python src/prepare_data.py caption \
 }
 ```
 
-### Step 4 – Auto-generate masks (optional)
+---
 
-Uses **SAM** (Meta's Segment Anything) to detect and mask furniture objects.
-Download the SAM checkpoint first:
+### Step 4 – Generate masks
+
+Four masking models are available. Choose based on your requirements:
+
+| Model | Flag | Approach | VRAM | Accuracy | Notes |
+|-------|------|----------|------|----------|-------|
+| **Grounded-SAM** | `--masker grounded_sam` | Text-prompted (GroundingDINO + SAM) | ~10 GB | ⭐⭐⭐⭐⭐ | **Recommended** – specify which furniture to mask |
+| **OneFormer** | `--masker oneformer` | Panoptic segmentation (ADE20K) | ~12 GB | ⭐⭐⭐⭐ | Category-level masks for 150+ indoor classes |
+| **SAM 2** | `--masker sam2` | Automatic (no labels needed) | ~8 GB | ⭐⭐⭐⭐ | Improved SAM, no download needed |
+| **SAM** | `--masker sam` | Automatic (centre heuristic) | ~7 GB | ⭐⭐⭐ | Requires manual checkpoint download |
+
+#### Grounded-SAM (recommended)
+
+Detects furniture by name and produces pixel-precise masks. Most useful when you
+know which object categories should be inpainted.
 
 ```bash
+# Install dependencies
+pip install groundingdino-py
+
+# Download SAM checkpoint
 mkdir -p checkpoints
 wget -P checkpoints https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+
+# Run (specify the furniture categories you want to mask)
+python src/prepare_data.py mask \
+    --dataset_dir      data/interior \
+    --masker           grounded_sam \
+    --sam_checkpoint   checkpoints/sam_vit_h_4b8939.pth \
+    --furniture_labels "sofa,armchair,chair,table,coffee table,bed,cabinet,lamp,curtain"
 ```
 
-Then run:
+#### OneFormer – semantic category masks
+
+Uses ADE20K panoptic segmentation (150 categories including sofa, chair, bed,
+table, cabinet, wardrobe, lamp, curtain, rug, mirror, etc.).
 
 ```bash
 python src/prepare_data.py mask \
+    --dataset_dir data/interior \
+    --masker      oneformer
+```
+
+#### SAM 2 – improved automatic masking
+
+No manual checkpoint download required (loaded from HuggingFace).
+
+```bash
+pip install 'git+https://github.com/facebookresearch/sam2.git'
+
+python src/prepare_data.py mask \
+    --dataset_dir data/interior \
+    --masker      sam2
+```
+
+#### SAM v1 – classic automatic masking
+
+```bash
+# Download checkpoint
+mkdir -p checkpoints
+wget -P checkpoints https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+
+python src/prepare_data.py mask \
     --dataset_dir    data/interior \
+    --masker         sam \
     --sam_checkpoint checkpoints/sam_vit_h_4b8939.pth \
-    --model_type     vit_h \
-    --device         cuda
+    --model_type     vit_h
 ```
 
 If no masks are provided, the training script generates **random masks** on-the-fly
-(bounding boxes, irregular strokes, or mixed – controlled by `data.mask_type` in the config).
+(bounding boxes, irregular strokes, or mixed – controlled by `data.mask_type` in
+`configs/train_config.yaml`).
 
 ---
 

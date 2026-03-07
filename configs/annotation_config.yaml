@@ -1,0 +1,145 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Annotation configuration – model recommendations for mask & caption generation
+#
+# Use this file as a reference when running src/prepare_data.py.
+# Pick the captioner and masker that best match your hardware and use-case.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPTIONING MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Model         HuggingFace ID                          VRAM   Speed   Quality
+#  ─────────────────────────────────────────────────────────────────────────────
+#  blip          Salesforce/blip-image-captioning-large  ~6 GB  fast    good
+#  blip2         Salesforce/blip2-opt-2.7b               ~15 GB medium  best     ← default
+#  florence2     microsoft/Florence-2-large              ~8 GB  fast    detailed
+#
+# Recommendation for interior design:
+#   • If VRAM is limited (≤ 8 GB):  use  blip  or  florence2
+#   • If VRAM is ≥ 16 GB:            use  blip2   (richer, longer captions)
+#   • For dense multi-object scenes: use  florence2  (region-aware captions)
+#
+# CLI example:
+#   python src/prepare_data.py caption --dataset_dir data/interior --captioner florence2
+# ─────────────────────────────────────────────────────────────────────────────
+
+captioning:
+  # Active captioner – change to "blip" or "florence2" as needed
+  captioner: "blip2"
+
+  models:
+    blip:
+      hf_id: "Salesforce/blip-image-captioning-large"
+      vram_gb: 6
+      batch_size: 16        # larger batches fit in memory
+      notes: >
+        Lightweight and fast. Good caption quality for single-object scenes.
+        No conditional prefix – generates free-form captions.
+
+    blip2:
+      hf_id: "Salesforce/blip2-opt-2.7b"
+      vram_gb: 15
+      batch_size: 4
+      interior_prefix: "An interior design photo of"
+      notes: >
+        Best overall caption quality. Supports a text prefix to guide the
+        model towards interior-specific descriptions.
+
+    florence2:
+      hf_id: "microsoft/Florence-2-large"
+      vram_gb: 8
+      batch_size: 8
+      task_token: "<MORE_DETAILED_CAPTION>"
+      notes: >
+        Produces dense, region-aware descriptions (furniture + spatial layout).
+        Well-suited for complex multi-object interior scenes.
+        Also supports object detection, grounding, and segmentation tasks.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MASKING MODELS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Model          Approach              VRAM   Accuracy  Notes
+#  ─────────────────────────────────────────────────────────────────────────────
+#  sam            Automatic (centre)    ~7 GB  medium    requires .pth download
+#  sam2           Automatic (centre)    ~8 GB  high      no download needed
+#  grounded_sam   Text-prompted         ~10 GB very high recommended for interiors ← default
+#  oneformer      Semantic segmentation ~12 GB high      ADE20K 150 categories
+#
+# Recommendation for interior design:
+#   • grounded_sam  – most accurate for furniture; specify labels you want to
+#                     mask ("sofa,chair,table,bed,cabinet,lamp")
+#   • oneformer     – good when you want semantic category masks (all sofas, all
+#                     chairs, etc.) rather than instance-level masks
+#   • sam2          – good general-purpose; use when you don't know the labels
+#   • sam           – use only if you already have the .pth checkpoint
+#
+# CLI examples:
+#   python src/prepare_data.py mask --dataset_dir data/interior \
+#       --masker grounded_sam \
+#       --furniture_labels "sofa,armchair,chair,table,coffee table,bed,cabinet,lamp" \
+#       --sam_checkpoint checkpoints/sam_vit_h_4b8939.pth
+#
+#   python src/prepare_data.py mask --dataset_dir data/interior --masker sam2
+#
+#   python src/prepare_data.py mask --dataset_dir data/interior --masker oneformer
+# ─────────────────────────────────────────────────────────────────────────────
+
+masking:
+  # Active masker – change to "sam", "sam2", or "oneformer" as needed
+  masker: "grounded_sam"
+
+  # Default furniture labels used by grounded_sam (comma-separated, no spaces)
+  furniture_labels: "sofa,armchair,chair,dining chair,table,coffee table,dining table,bed,wardrobe,cabinet,bookshelf,desk,lamp,floor lamp,curtain,rug,mirror"
+
+  models:
+    sam:
+      approach: "Automatic segmentation + centre heuristic"
+      hf_id: null
+      checkpoint_url: "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+      vram_gb: 7
+      points_per_side: 32
+      pred_iou_thresh: 0.86
+      stability_score_thresh: 0.92
+      min_mask_region_area: 2000
+      notes: >
+        Classic SAM in fully automatic mode. Picks the segment nearest the
+        image centre as a proxy for the main furniture item. Requires a
+        manually downloaded .pth checkpoint.
+
+    sam2:
+      approach: "Automatic segmentation + centre heuristic (improved)"
+      hf_id: "facebook/sam2-hiera-large"
+      vram_gb: 8
+      points_per_side: 32
+      pred_iou_thresh: 0.86
+      notes: >
+        SAM 2 with improved boundary accuracy. Loaded directly from
+        HuggingFace – no manual download needed. Also supports video
+        sequences if your dataset contains room walk-throughs.
+
+    grounded_sam:
+      approach: "Text-prompted detection (GroundingDINO) + SAM segmentation"
+      hf_id_detector: "IDEA-Research/grounding-dino-tiny"
+      hf_id_sam: null   # requires local SAM checkpoint
+      checkpoint_url: "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+      vram_gb: 10
+      box_threshold: 0.35
+      text_threshold: 0.25
+      notes: >
+        Most accurate approach for interior design. GroundingDINO detects
+        furniture items by name; SAM produces pixel-precise masks for each
+        detected bounding box. All matching furniture items in the image are
+        combined into a single inpainting mask.
+
+    oneformer:
+      approach: "Panoptic segmentation (ADE20K 150 categories)"
+      hf_id: "shi-labs/oneformer_ade20k_swin_large"
+      vram_gb: 12
+      notes: >
+        Predicts semantic labels for every pixel using ADE20K categories
+        (sofa, chair, bed, table, cabinet, lamp, curtain, rug, mirror, etc.).
+        Good when you want consistent category-level masks across the dataset
+        rather than instance-level masks.
