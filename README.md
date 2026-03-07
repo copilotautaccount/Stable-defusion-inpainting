@@ -8,13 +8,14 @@ Fine-tune **Stable Diffusion Inpainting** on an interior-design dataset to intel
 
 1. [Requirements](#requirements)
 2. [Project Structure](#project-structure)
-3. [Quick Start](#quick-start)
-4. [Dataset Preparation](#dataset-preparation)
-5. [Training](#training)
-6. [Inference](#inference)
-7. [Configuration Reference](#configuration-reference)
-8. [Hardware Requirements](#hardware-requirements)
-9. [Recommended Datasets](#recommended-datasets)
+3. [Full Pipeline – Execution Order](#full-pipeline--execution-order)
+4. [Quick Start](#quick-start)
+5. [Dataset Preparation](#dataset-preparation)
+6. [Training](#training)
+7. [Inference](#inference)
+8. [Configuration Reference](#configuration-reference)
+9. [Hardware Requirements](#hardware-requirements)
+10. [Recommended Datasets](#recommended-datasets)
 
 ---
 
@@ -74,6 +75,7 @@ Stable-defusion-inpainting/
 ├── scripts/
 │   ├── setup.sh               # Install dependencies
 │   ├── prepare_data.sh        # Run full data pipeline
+│   ├── run_pipeline.sh        # ← Run EVERYTHING in order (setup → data → train)
 │   └── train.sh               # Launch training
 ├── src/
 │   ├── dataset.py             # PyTorch Dataset + mask generators
@@ -89,7 +91,136 @@ Stable-defusion-inpainting/
 
 ---
 
+## Full Pipeline – Execution Order
+
+> **Short answer:** copy images → run one command.
+>
+> ```bash
+> # Place your images in data/raw/, then:
+> bash scripts/run_pipeline.sh
+> ```
+>
+> The script walks through every stage in the correct order and can be
+> re-run at any time; individual stages can be skipped with
+> `SKIP_<STAGE>=1` env vars.
+
+The table below shows the **mandatory sequence** for going from raw images to
+a working inpainting model:
+
+| # | Stage | Script / Command | Input | Output |
+|---|-------|-----------------|-------|--------|
+| 0 | Check environment | *(automatic)* | — | — |
+| **1** | **Install dependencies** | `bash scripts/setup.sh` | `requirements.txt` | Python packages installed |
+| **2** | **Split images** | `python src/prepare_data.py split` | `data/raw/` | `data/interior/{train,val}/images/` |
+| **3** | **Generate captions** | `python src/prepare_data.py caption` | split images | `data/interior/{train,val}/captions.json` |
+| **4** | **Generate masks** | `python src/prepare_data.py mask` | split images | `data/interior/{train,val}/masks/` |
+| **5** | **Configure accelerate** | `accelerate config` *(once)* | — | `~/.cache/huggingface/accelerate/default_config.yaml` |
+| **6** | **Fine-tune model** | `bash scripts/train.sh` | dataset + config | `outputs/interior-inpainting/` |
+| 7 | *(optional)* Run inference | `python src/inference.py` | trained model + image + mask | inpainted image |
+
+### Why this order matters
+
+```
+Raw images
+    │
+    ▼  Stage 2: split
+data/interior/
+├── train/images/  ─┐
+└── val/images/    ─┤  Stage 3: caption  →  captions.json
+                    └  Stage 4: mask     →  masks/*.png
+                              │
+                              ▼  Stage 5: accelerate config (once)
+                              │
+                              ▼  Stage 6: train.py
+                        outputs/interior-inpainting/
+                              │
+                              ▼  Stage 7: inference.py
+                          result.png
+```
+
+### One-command run (all stages)
+
+```bash
+# Copy your interior images first
+cp -r /path/to/your/photos  data/raw/
+
+# Run the full pipeline (florence2 captions + grounded_sam masks by default)
+bash scripts/run_pipeline.sh
+```
+
+### Run with custom model choices
+
+```bash
+# Use BLIP-2 for captions and SAM 2 for masks
+CAPTIONER=blip2 MASKER=sam2 bash scripts/run_pipeline.sh
+
+# Use BLIP + OneFormer on a machine with limited VRAM
+CAPTIONER=blip MASKER=oneformer bash scripts/run_pipeline.sh
+```
+
+### Re-run only specific stages
+
+```bash
+# Skip install and accelerate config (already done), re-run caption + mask + train
+SKIP_INSTALL=1 SKIP_ACCELERATE=1 bash scripts/run_pipeline.sh
+
+# Only retrain (captions & masks already exist)
+SKIP_INSTALL=1 SKIP_SPLIT=1 SKIP_CAPTION=1 SKIP_MASK=1 SKIP_ACCELERATE=1 \
+    bash scripts/run_pipeline.sh
+```
+
+### Step-by-step (manual)
+
+If you prefer to run each step individually:
+
+```bash
+# ── Step 1: Install ───────────────────────────────────────────
+bash scripts/setup.sh
+
+# ── Step 2: Split raw images ──────────────────────────────────
+python src/prepare_data.py split \
+    --source_dir data/raw \
+    --output_dir data/interior \
+    --val_ratio  0.1
+
+# ── Step 3: Generate captions ─────────────────────────────────
+# Pick ONE of: blip (6 GB) | florence2 (8 GB, recommended) | blip2 (15 GB)
+python src/prepare_data.py caption \
+    --dataset_dir data/interior \
+    --captioner   florence2 \
+    --device      cuda
+
+# ── Step 4: Generate masks ────────────────────────────────────
+# Pick ONE of: grounded_sam (recommended) | oneformer | sam2 | sam
+python src/prepare_data.py mask \
+    --dataset_dir      data/interior \
+    --masker           grounded_sam \
+    --sam_checkpoint   checkpoints/sam_vit_h_4b8939.pth \
+    --furniture_labels "sofa,chair,table,bed,cabinet,lamp" \
+    --device           cuda
+
+# ── Step 5: Configure accelerate (once per machine) ───────────
+accelerate config
+
+# ── Step 6: Fine-tune ─────────────────────────────────────────
+bash scripts/train.sh
+# or: python src/train.py --config configs/train_config.yaml
+
+# ── Step 7: Inference (optional) ──────────────────────────────
+python src/inference.py \
+    --model_dir outputs/interior-inpainting \
+    --image     data/interior/val/images/room_001.jpg \
+    --mask      data/interior/val/masks/room_001.png \
+    --prompt    "a modern living room with a white linen sofa" \
+    --output    results/result.png
+```
+
+---
+
 ## Quick Start
+
+See [Full Pipeline – Execution Order](#full-pipeline--execution-order) for the
+complete step-by-step guide.  The minimal path is:
 
 ```bash
 # 1. Install dependencies
@@ -98,14 +229,21 @@ bash scripts/setup.sh
 # 2. Place your interior images in data/raw/
 #    (JPG / PNG / WebP, any resolution)
 
-# 3. Prepare dataset (split + caption + mask)
+# 3. Prepare dataset: split → caption → mask  (all-in-one)
 bash scripts/prepare_data.sh
 
-# 4. Configure accelerate for your hardware
+# 4. Configure accelerate for your hardware (interactive, run once)
 accelerate config
 
 # 5. Start training
 bash scripts/train.sh
+```
+
+Or run **all stages in one command**:
+
+```bash
+cp -r /path/to/photos  data/raw/
+bash scripts/run_pipeline.sh
 ```
 
 ---
