@@ -16,8 +16,9 @@ Fine-tune **Stable Diffusion Inpainting** on an interior-design dataset to intel
 8. [Configuration Reference](#configuration-reference)
 9. [Hardware Requirements](#hardware-requirements)
 10. [Recommended Datasets](#recommended-datasets)
-11. [Getting Updates](#getting-updates)
-12. [Running Tests](#running-tests)
+11. [Fine-tuning Deep Dive](#fine-tuning-deep-dive)
+12. [Getting Updates](#getting-updates)
+13. [Running Tests](#running-tests)
 
 ---
 
@@ -544,6 +545,337 @@ For interior design inpainting, the following public datasets work well:
 | [Structured3D](https://structured3d-dataset.org/) | 196 500 | Photo-realistic panoramic rooms |
 | [SUN RGB-D](https://rgbd.cs.princeton.edu/) | 10 000+ | Real indoor RGBD images |
 | Scraped Pinterest/Houzz images | Custom | High-quality real-world interiors |
+
+---
+
+## Fine-tuning Deep Dive
+
+> **Tiếng Việt / Vietnamese** — phần này trình bày chi tiết từng bước trong quá trình
+> fine-tune model mà script `src/train.py` thực hiện.
+> An English summary follows each Vietnamese block.
+
+---
+
+### Tổng quan kiến trúc (Architecture Overview)
+
+Stable Diffusion Inpainting gồm **4 thành phần** chính. Trong quá trình fine-tune
+chỉ **UNet** được cập nhật trọng số; các thành phần còn lại bị đóng băng (frozen):
+
+| Thành phần | Vai trò | Được huấn luyện? |
+|------------|---------|-----------------|
+| **VAE** (`AutoencoderKL`) | Nén ảnh RGB 512×512 → không gian latent 64×64×4 (encode) và ngược lại (decode) | ❌ Frozen |
+| **Text Encoder** (`CLIPTextModel`) | Chuyển text prompt thành vector 768 chiều để hướng dẫn UNet | ❌ Frozen |
+| **UNet** (`UNet2DConditionModel`) | Mô hình chính dự đoán nhiễu tại mỗi bước khuếch tán | ✅ Trainable |
+| **Noise Scheduler** (`DDPMScheduler`) | Quản lý quá trình thêm/xoá nhiễu, không có trọng số | — |
+
+> **EN:** Only the UNet is trained. VAE and CLIP text encoder are frozen — their
+> weights never change. The noise scheduler has no learnable parameters.
+
+---
+
+### Bước 1 – Khởi tạo và cấu hình (Initialisation)
+
+```python
+# src/train.py  lines 210-215
+tokenizer    = CLIPTokenizer.from_pretrained(pretrained, subfolder="tokenizer")
+text_encoder = CLIPTextModel.from_pretrained(pretrained, subfolder="text_encoder")
+vae          = AutoencoderKL.from_pretrained(pretrained, subfolder="vae")
+unet         = UNet2DConditionModel.from_pretrained(pretrained, subfolder="unet")
+scheduler    = DDPMScheduler.from_pretrained(pretrained, subfolder="scheduler")
+```
+
+**Điều xảy ra:**
+- Tải trọng số đã được pre-train từ `runwayml/stable-diffusion-inpainting`
+  (HuggingFace Hub).
+- VAE và text encoder bị đóng băng (`requires_grad_(False)`) — chúng không
+  thay đổi trong suốt quá trình huấn luyện.
+- UNet (hoặc chỉ các adapter LoRA của nó) được đánh dấu là trainable.
+
+> **EN:** All four components are loaded from the pre-trained checkpoint.
+> VAE and text encoder are immediately frozen. Only the UNet (or its LoRA
+> adapters) will accumulate gradients.
+
+---
+
+### Bước 2 – Cài LoRA vào UNet (Inject LoRA Adapters)
+
+```python
+# src/train.py  lines 95-111
+lora_cfg = LoraConfig(
+    r=16,           # rank — số chiều ẩn của ma trận low-rank
+    lora_alpha=32,  # scaling: weight_scale = alpha / rank = 2.0
+    target_modules=["to_q","to_k","to_v","to_out.0",
+                    "proj_in","proj_out","ff.net.0.proj","ff.net.2"],
+    lora_dropout=0.05,
+    bias="none",
+)
+unet = get_peft_model(unet, lora_cfg)
+```
+
+**Điều xảy ra:**
+- Thay vì cập nhật **toàn bộ** ~860 triệu tham số của UNet, LoRA chèn thêm
+  **2 ma trận nhỏ** (A và B) vào từng lớp attention/projection được chọn.
+- Số tham số có thể huấn luyện giảm xuống còn khoảng **~8–15 triệu** (< 2%).
+- Ma trận A khởi tạo ngẫu nhiên (Gaussian), ma trận B khởi tạo bằng 0 →
+  lúc đầu LoRA không thay đổi output của lớp đó.
+- Công thức: `W' = W₀ + (alpha/rank) × B×A`
+
+```
+Lớp attention gốc:          W₀  (frozen, không đổi)
+                              ↓
+LoRA thêm vào:         + (α/r) · B · A   ← chỉ A và B được huấn luyện
+```
+
+> **EN:** Instead of updating all ~860 M UNet parameters, LoRA injects tiny
+> rank-16 matrices (A, B) into the eight named attention/projection modules.
+> Only ~8–15 M parameters are trainable. The effective weight update is
+> `ΔW = (alpha/rank) × B × A`.
+
+---
+
+### Bước 3 – Chuẩn bị dữ liệu (Dataset & DataLoader)
+
+Mỗi batch gồm các tensor sau (xem `src/dataset.py`):
+
+| Tensor | Shape | Ý nghĩa |
+|--------|-------|---------|
+| `pixel_values` | `(B, 3, 512, 512)` | Ảnh gốc chuẩn hoá `[-1, 1]` |
+| `masked_image` | `(B, 3, 512, 512)` | Ảnh gốc với vùng mask bị tô đen (× 0) |
+| `mask` | `(B, 1, 512, 512)` | 0 = giữ nguyên, 1 = vùng cần inpaint |
+| `input_ids` | `(B, 77)` | Token IDs của text caption (CLIP tokenizer) |
+
+**Augmentation (chỉ khi training):**
+- Random horizontal flip (50%)
+- Color jitter nhẹ (brightness ±10%, contrast ±10%, saturation ±10%, hue ±5%)
+
+**Mask generation** (nếu không có mask sẵn):
+- `"bbox"` – hình chữ nhật ngẫu nhiên
+- `"irregular"` – nét cọ tự do (free-form brush strokes)
+- `"mixed"` (mặc định) – 50% bbox, 50% irregular
+
+> **EN:** Each DataLoader batch contains the original image, the masked image
+> (inpaint region zeroed out), the binary mask, and tokenised caption IDs.
+> Light augmentations (flip + colour jitter) are applied during training.
+
+---
+
+### Bước 4 – Vòng lặp huấn luyện từng step (Per-step Training Loop)
+
+Đây là trái tim của quá trình fine-tune. Mỗi step thực hiện 8 micro-step sau:
+
+#### 4a. Encode ảnh → latent space (VAE Encoding)
+
+```python
+# src/train.py  lines 357-363
+latents        = vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
+masked_latents = vae.encode(masked_image).latent_dist.sample() * vae.config.scaling_factor
+```
+
+- VAE nén ảnh `512×512×3` → `64×64×4` (hệ số nén 64×).
+- `scaling_factor ≈ 0.18215` — chuẩn hoá phân phối latent.
+- `masked_latents` là latent của ảnh đã xoá vùng inpaint.
+
+> **EN:** The VAE encodes both the original and the masked image into 64×64×4
+> latent tensors. All diffusion math runs in this compressed latent space.
+
+#### 4b. Resize mask → latent resolution
+
+```python
+# src/train.py  lines 365-370
+mask_latent = F.interpolate(mask, size=latents.shape[-2:], mode="nearest")
+# 512×512×1  →  64×64×1
+```
+
+> **EN:** The pixel-space mask is downsampled to match the 64×64 latent grid.
+
+#### 4c. Thêm nhiễu ngẫu nhiên (Forward Diffusion / Add Noise)
+
+```python
+# src/train.py  lines 372-382
+noise      = torch.randn_like(latents)           # Gaussian noise ε ~ N(0,I)
+timesteps  = torch.randint(0, 1000, (B,))        # t ~ Uniform[0, 999]
+noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+# = √ᾱₜ · latents  +  √(1-ᾱₜ) · noise    (DDPM formula)
+```
+
+- `t` được lấy ngẫu nhiên từ 0–999 (1000 timesteps).
+- Timestep càng lớn → ảnh nhiễu càng nhiều.
+- Mục tiêu: model học cách **dự đoán phần nhiễu** đã được thêm vào.
+
+> **EN:** A random Gaussian noise tensor `ε` is sampled, a random timestep
+> `t` is drawn, and the DDPM formula mixes the clean latent with noise to
+> produce `noisy_latents`. The model's job is to un-mix this.
+
+#### 4d. Encode text caption (CLIP Text Encoding)
+
+```python
+# src/train.py  lines 384-387
+encoder_hidden_states = text_encoder(input_ids)[0]
+# shape: (B, 77, 768) — 77 token positions, 768-dim embeddings
+```
+
+> **EN:** The frozen CLIP text encoder converts the tokenised caption into
+> 768-dimensional contextual embeddings that the UNet will cross-attend to.
+
+#### 4e. Tạo input 9 channel cho UNet (9-channel UNet Input)
+
+```python
+# src/train.py  lines 389-391
+unet_input = torch.cat([noisy_latents, mask_latent, masked_latents], dim=1)
+# Channels:    [4 channels]  [1 channel] [4 channels]  =  9 channels total
+```
+
+**Đây là điểm khác biệt quan trọng** giữa SD Inpainting và SD gốc:
+- SD gốc: UNet nhận input **4 channels** (chỉ noisy latent).
+- SD Inpainting: UNet nhận **9 channels** = noisy latent + mask + masked image latent.
+- Cấu trúc này giúp UNet "nhìn thấy" vùng nào cần inpaint và phần ảnh
+  nào cần giữ nguyên.
+
+```
+Noisy latent   [4ch]  ┐
+Mask           [1ch]  ├──→  UNet (9-channel input conv)  →  noise prediction [4ch]
+Masked latent  [4ch]  ┘
+```
+
+> **EN:** This is the inpainting-specific design. The standard SD UNet takes
+> 4 channels; the inpainting variant takes 9 — appending the resized mask and
+> the masked-image latent so the UNet "sees" what must be filled in.
+
+#### 4f. UNet dự đoán nhiễu (Noise Prediction)
+
+```python
+# src/train.py  lines 393-396
+model_pred = unet(unet_input, timesteps, encoder_hidden_states).sample
+# shape: (B, 4, 64, 64)  — predicted noise ε̂
+```
+
+- UNet là kiến trúc **U-Net với Transformer blocks** (cross-attention với text).
+- Với mỗi timestep `t` và mỗi text condition, UNet dự đoán lượng nhiễu `ε̂`.
+
+> **EN:** The UNet processes the 9-channel input, the timestep embedding, and
+> the CLIP text context via cross-attention, and outputs a 4-channel predicted
+> noise tensor.
+
+#### 4g. Tính hàm mất mát (Loss Computation)
+
+```python
+# src/train.py  lines 398-408
+target = noise                              # prediction_type = "epsilon"
+loss   = F.mse_loss(model_pred, target)    # MSE( ε̂, ε )
+```
+
+- Dùng **MSE loss** (Mean Squared Error) giữa nhiễu dự đoán và nhiễu thực.
+- Đây là tiêu chuẩn DDPM / LDM: model tối thiểu hoá `E[‖ε - ε̂‖²]`.
+
+> **EN:** The loss is the mean squared error between the predicted noise and
+> the actual noise that was added. Minimising this is equivalent to maximising
+> the ELBO of the diffusion model's variational lower bound.
+
+#### 4h. Backward & cập nhật trọng số (Backprop + Optimiser Step)
+
+```python
+# src/train.py  lines 414-419
+accelerator.backward(loss)
+accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)   # gradient clipping
+optimizer.step()       # AdamW update  (chỉ LoRA A, B matrices)
+lr_scheduler.step()    # cosine LR decay
+optimizer.zero_grad()
+```
+
+- **Gradient accumulation = 4** → gradient được tích luỹ qua 4 micro-batch
+  trước khi update một lần. Effective batch size = `2 × 4 = 8`.
+- **Gradient clipping** tại `max_norm=1.0` giúp ổn định training.
+- **Cosine LR scheduler** với warmup 200 steps: LR tăng dần rồi giảm dần
+  theo đường cong cosine.
+
+> **EN:** Gradients flow only into the LoRA A and B matrices (the frozen
+> weights receive zero gradient). After 4 accumulation steps, AdamW updates
+> the parameters. A cosine schedule with 200-step linear warmup governs
+> the learning rate.
+
+---
+
+### Bước 5 – Checkpoint và Validation (Checkpointing & Validation)
+
+**Checkpoint** (mỗi 500 steps):
+```python
+# src/train.py  lines 434-448
+accelerator.save_state(f"outputs/interior-inpainting/checkpoint-{global_step}/")
+# Giữ tối đa 3 checkpoint gần nhất, xoá checkpoint cũ
+```
+
+**Validation** (mỗi 500 steps):
+- Tạo ảnh trắng (dummy image) + mask trung tâm.
+- Chạy inference 20 steps với 4 prompt validation.
+- Log kết quả lên W&B để theo dõi chất lượng trực quan.
+
+> **EN:** Every 500 steps the full accelerator state is saved (keeping only
+> the 3 most recent checkpoints). The validation loop runs 20-step inference
+> on four fixed prompts and uploads the results to W&B for qualitative
+> monitoring.
+
+---
+
+### Bước 6 – Lưu model cuối (Save Final Model)
+
+```python
+# src/train.py  lines 470-483
+if lora_enabled:
+    unet.save_pretrained("outputs/interior-inpainting/unet_lora/")
+else:
+    pipeline.save_pretrained("outputs/interior-inpainting/")
+```
+
+**LoRA mode (mặc định):**
+- Chỉ lưu các adapter nhỏ (`unet_lora/`) — kích thước ~50–200 MB.
+- Khi inference: tải SD Inpainting gốc + nạp adapter lên trên.
+
+**Full fine-tune mode:**
+- Lưu toàn bộ pipeline (~4–7 GB).
+
+> **EN:** In LoRA mode only the small adapter weights (~50–200 MB) are saved.
+> At inference time the base model is loaded and the adapters are applied on
+> top. Full fine-tune mode saves the entire pipeline.
+
+---
+
+### Tóm tắt luồng dữ liệu qua một training step
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Input: (image, mask, caption)                              │
+│                                                             │
+│  1. VAE.encode(image)       → latents        [B,4,64,64]   │
+│  2. VAE.encode(masked_img)  → masked_latents [B,4,64,64]   │
+│  3. Interpolate(mask)       → mask_64        [B,1,64,64]   │
+│  4. randn_like(latents)     → ε (noise)      [B,4,64,64]   │
+│  5. randint(0,1000)         → t (timestep)   [B]           │
+│  6. add_noise(latents,ε,t)  → noisy_latents  [B,4,64,64]   │
+│  7. CLIP.encode(caption)    → text_embeds    [B,77,768]    │
+│                                                             │
+│  8. UNet([noisy_latents | mask_64 | masked_latents],        │
+│          t, text_embeds)    → ε̂ (pred noise) [B,4,64,64]   │
+│                                                             │
+│  9. loss = MSE(ε̂, ε)                                       │
+│ 10. loss.backward() → update only LoRA A, B                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Tham số cấu hình quan trọng nhất
+
+| Tham số | Giá trị mặc định | Ý nghĩa |
+|---------|-----------------|---------|
+| `lora.rank` | 16 | Số chiều của low-rank matrices — tăng → chất lượng cao hơn nhưng tốn VRAM |
+| `lora.alpha` | 32 | Hệ số scale = alpha/rank = 2.0 |
+| `training.num_train_epochs` | 50 | Số epoch — thường cần 20–100 tuỳ dataset |
+| `training.learning_rate` | 1e-4 | LR ban đầu — quá cao → training không ổn định |
+| `training.train_batch_size` | 2 | Training batch size per GPU |
+| `training.gradient_accumulation_steps` | 4 | Effective batch = 2 × 4 = 8 |
+| `training.mixed_precision` | fp16 | Giảm ~50% VRAM, tốc độ tăng đáng kể |
+| `data.mask_type` | mixed | Loại mask ngẫu nhiên dùng khi không có mask sẵn |
+| `data.image_size` | 512 | Độ phân giải training — 768 cần nhiều VRAM hơn |
 
 ---
 
