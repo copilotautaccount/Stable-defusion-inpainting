@@ -519,8 +519,14 @@ class TestFlorence2Loading:
     """
 
     def _capture_model_kwargs(self, tf_version: tuple, tiny_dataset) -> dict:
-        """Return the kwargs that AutoModelForCausalLM.from_pretrained was
-        called with for the given simulated *tf_version*."""
+        """Return the kwargs that the selected model class's from_pretrained was
+        called with for the given simulated *tf_version*.
+
+        For tf_version < (4, 45) the legacy AutoModelForCausalLM path is used;
+        for >= (4, 45) the native Florence2ForConditionalGeneration path is used.
+        Both mocks raise StopIteration to abort after the load call so we capture
+        the kwargs without running inference.
+        """
         import sys
         captured: dict = {}
 
@@ -528,15 +534,20 @@ class TestFlorence2Loading:
         mock_processor_cls = MagicMock()
         mock_processor_cls.from_pretrained.return_value = mock_processor_inst
 
-        def fake_model_from_pretrained(model_id, **kwargs):
+        def fake_from_pretrained(model_id, **kwargs):
             captured.update(kwargs)
             raise StopIteration("abort-after-load")  # skip inference
 
-        mock_model_cls = MagicMock()
-        mock_model_cls.from_pretrained.side_effect = fake_model_from_pretrained
+        # Mock both possible model classes; whichever the code picks will fire.
+        mock_auto_model_cls = MagicMock()
+        mock_auto_model_cls.from_pretrained.side_effect = fake_from_pretrained
+
+        mock_native_model_cls = MagicMock()
+        mock_native_model_cls.from_pretrained.side_effect = fake_from_pretrained
 
         fake_tf = MagicMock()
-        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoModelForCausalLM = mock_auto_model_cls
+        fake_tf.Florence2ForConditionalGeneration = mock_native_model_cls
         fake_tf.AutoProcessor = mock_processor_cls
 
         paths = _image_paths(tiny_dataset / "train" / "images")
@@ -573,19 +584,32 @@ class TestFlorence2Loading:
         assert "torch_dtype" in kwargs
         assert "dtype" not in kwargs
 
-    def test_processor_no_trust_remote_code_on_new_transformers(self, tiny_dataset):
-        """AutoProcessor.from_pretrained should be called WITHOUT
-        trust_remote_code on transformers >= 4.45."""
+    def test_processor_always_trust_remote_code_on_new_transformers(self, tiny_dataset):
+        """AutoProcessor.from_pretrained should be called WITH trust_remote_code=True
+        even on transformers >= 4.45.
+
+        The native Florence2Processor.__init__ accesses tokenizer.image_token which
+        does not exist on RobertaTokenizer (the underlying tokenizer of Florence-2),
+        raising:
+            AttributeError: RobertaTokenizer has no attribute image_token
+
+        Passing trust_remote_code=True forces the cached remote processor code that
+        avoids this attribute access, fixing the crash on transformers 5.x.
+        """
         import sys
 
         mock_processor_cls = MagicMock()
         mock_processor_cls.from_pretrained.return_value = MagicMock()
 
-        mock_model_cls = MagicMock()
-        mock_model_cls.from_pretrained.side_effect = StopIteration("abort")
+        mock_auto_model_cls = MagicMock()
+        mock_auto_model_cls.from_pretrained.side_effect = StopIteration("abort")
+
+        mock_native_model_cls = MagicMock()
+        mock_native_model_cls.from_pretrained.side_effect = StopIteration("abort")
 
         fake_tf = MagicMock()
-        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoModelForCausalLM = mock_auto_model_cls
+        fake_tf.Florence2ForConditionalGeneration = mock_native_model_cls
         fake_tf.AutoProcessor = mock_processor_cls
 
         paths = _image_paths(tiny_dataset / "train" / "images")
@@ -595,7 +619,7 @@ class TestFlorence2Loading:
                 pd_mod._caption_florence2(paths[:1], "cpu", batch_size=1)
 
         _, proc_kwargs = mock_processor_cls.from_pretrained.call_args
-        assert proc_kwargs.get("trust_remote_code") is not True
+        assert proc_kwargs.get("trust_remote_code") is True
 
     def test_processor_trust_remote_code_on_old_transformers(self, tiny_dataset):
         """AutoProcessor.from_pretrained should be called WITH
@@ -605,11 +629,15 @@ class TestFlorence2Loading:
         mock_processor_cls = MagicMock()
         mock_processor_cls.from_pretrained.return_value = MagicMock()
 
-        mock_model_cls = MagicMock()
-        mock_model_cls.from_pretrained.side_effect = StopIteration("abort")
+        mock_auto_model_cls = MagicMock()
+        mock_auto_model_cls.from_pretrained.side_effect = StopIteration("abort")
+
+        mock_native_model_cls = MagicMock()
+        mock_native_model_cls.from_pretrained.side_effect = StopIteration("abort")
 
         fake_tf = MagicMock()
-        fake_tf.AutoModelForCausalLM = mock_model_cls
+        fake_tf.AutoModelForCausalLM = mock_auto_model_cls
+        fake_tf.Florence2ForConditionalGeneration = mock_native_model_cls
         fake_tf.AutoProcessor = mock_processor_cls
 
         paths = _image_paths(tiny_dataset / "train" / "images")

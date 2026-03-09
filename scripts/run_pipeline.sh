@@ -23,6 +23,35 @@
 # ═══════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
+# ── tmux guard ─────────────────────────────────────────────────────────────
+# Re-launch the entire pipeline inside a tmux session so it survives SSH
+# disconnects and laptop sleep.  Skip with NO_TMUX=1.
+TMUX_SESSION="${TMUX_SESSION:-sd-pipeline}"
+if [ "${NO_TMUX:-0}" != "1" ] && [ -z "${TMUX:-}" ]; then
+    if command -v tmux &>/dev/null; then
+        if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            echo "tmux session '$TMUX_SESSION' already exists."
+            echo "  Attach : tmux attach -t $TMUX_SESSION"
+            echo "  Kill & restart: tmux kill-session -t $TMUX_SESSION && bash scripts/run_pipeline.sh"
+            exit 0
+        fi
+        echo "=== Launching full pipeline inside tmux session '$TMUX_SESSION' ==="
+        echo "    All stages will continue even if SSH disconnects or laptop sleeps."
+        echo ""
+        echo "  Attach later  : tmux attach -t $TMUX_SESSION"
+        echo "  Detach (keep running): Ctrl+B then D"
+        echo ""
+        # Pass all original env vars + NO_TMUX=1 so the re-spawned script skips this block
+        tmux new-session -d -s "$TMUX_SESSION" \
+            "cd $(pwd) && NO_TMUX=1 bash scripts/run_pipeline.sh $(printf '%q ' "$@"); echo ''; echo '=== Pipeline finished. Press any key to close ==='; read -n1"
+        tmux attach -t "$TMUX_SESSION"
+        exit 0
+    else
+        echo "WARNING: tmux not found – running in current shell (will stop on SSH disconnect)."
+    fi
+fi
+# ───────────────────────────────────────────────────────────────────────────
+
 # ── Configuration ──────────────────────────────────────────────────────────
 # Paths
 SOURCE_DIR="${SOURCE_DIR:-data/raw}"            # directory with your raw images
@@ -218,8 +247,13 @@ _header "STAGE 5 – Configure accelerate  (accelerate config)"
 #  This step is interactive.  Run it once on a new machine.
 #  Skip with:  SKIP_ACCELERATE=1 bash scripts/run_pipeline.sh
 
+ACCELERATE_CFG="${HOME}/.cache/huggingface/accelerate/default_config.yaml"
 if [ "${SKIP_ACCELERATE:-0}" = "1" ]; then
     _skip "ACCELERATE"
+elif [ -f "$ACCELERATE_CFG" ]; then
+    echo "  Accelerate config already exists at $ACCELERATE_CFG — skipping wizard."
+    echo "  Mixed precision : $(grep mixed_precision "$ACCELERATE_CFG" | awk '{print $2}')"
+    echo "  Num processes   : $(grep num_processes   "$ACCELERATE_CFG" | awk '{print $2}')"
 else
     echo "  Starting 'accelerate config' …"
     echo "  (Set SKIP_ACCELERATE=1 to skip this step on subsequent runs.)"

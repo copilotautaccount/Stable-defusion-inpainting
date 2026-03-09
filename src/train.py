@@ -17,6 +17,7 @@ accelerate launch --num_processes=4 src/train.py --config configs/train_config.y
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -121,6 +122,7 @@ def log_validation(
     accelerator: Accelerator,
     epoch: int,
     step: int,
+    weight_dtype: torch.dtype = torch.float32,
 ) -> None:
     """Run the pipeline on fixed validation prompts and log images."""
     if not cfg.validation.validation_prompts:
@@ -130,33 +132,59 @@ def log_validation(
     val_dir = Path(cfg.training.output_dir) / "validation"
     val_dir.mkdir(parents=True, exist_ok=True)
 
+    from PIL import Image as PILImage
+    import numpy as np
+
+    # Collect real val images + masks for meaningful visual quality tracking.
+    _img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    val_images_dir = Path(cfg.data.dataset_dir) / cfg.data.val_split / "images"
+    val_masks_dir  = Path(cfg.data.dataset_dir) / cfg.data.val_split / "masks"
+    val_img_paths = sorted(
+        p for p in val_images_dir.iterdir() if p.suffix.lower() in _img_exts
+    ) if val_images_dir.exists() else []
+
     images = []
-    for i, prompt in enumerate(cfg.validation.validation_prompts[: cfg.validation.num_validation_images]):
-        # Use a white dummy image + centre-rectangle mask for visual tracking
-        dummy_img = torch.ones(1, 3, cfg.training.resolution, cfg.training.resolution)
-        dummy_mask = torch.zeros(1, 1, cfg.training.resolution, cfg.training.resolution)
-        h, w = cfg.training.resolution, cfg.training.resolution
-        dummy_mask[:, :, h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 1.0
+    num_to_show = min(cfg.validation.num_validation_images, len(cfg.validation.validation_prompts))
+    for i, prompt in enumerate(cfg.validation.validation_prompts[:num_to_show]):
+        res = cfg.training.resolution
 
-        from PIL import Image as PILImage
-        import numpy as np
+        if val_img_paths:
+            # Cycle through available val images so each prompt gets a different one
+            img_path = val_img_paths[i % len(val_img_paths)]
+            pil_img = PILImage.open(img_path).convert("RGB").resize(
+                (res, res), PILImage.LANCZOS
+            )
+            # Use the paired mask when it exists and is non-empty
+            mask_path = val_masks_dir / (img_path.stem + ".png")
+            if mask_path.exists():
+                mask_arr = np.array(
+                    PILImage.open(mask_path).convert("L").resize((res, res), PILImage.NEAREST)
+                )
+            else:
+                mask_arr = np.zeros((res, res), dtype=np.uint8)
 
-        pil_img = PILImage.fromarray(
-            ((dummy_img[0].permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255).astype(np.uint8)
-        )
-        pil_mask = PILImage.fromarray(
-            (dummy_mask[0, 0].numpy() * 255).astype(np.uint8)
-        )
+            # Fall back to a centre-rectangle mask if the mask is all-black
+            if mask_arr.max() == 0:
+                mask_arr[res // 4 : 3 * res // 4, res // 4 : 3 * res // 4] = 255
 
-        out = pipeline(
-            prompt=prompt,
-            image=pil_img,
-            mask_image=pil_mask,
-            height=cfg.training.resolution,
-            width=cfg.training.resolution,
-            num_inference_steps=20,
-            generator=generator,
-        ).images[0]
+            pil_mask = PILImage.fromarray(mask_arr)
+        else:
+            # No val images on disk – last resort: white image + centre rect mask
+            pil_img  = PILImage.fromarray(np.full((res, res, 3), 255, dtype=np.uint8))
+            mask_arr = np.zeros((res, res), dtype=np.uint8)
+            mask_arr[res // 4 : 3 * res // 4, res // 4 : 3 * res // 4] = 255
+            pil_mask = PILImage.fromarray(mask_arr)
+
+        with torch.autocast(accelerator.device.type, dtype=weight_dtype):
+            out = pipeline(
+                prompt=prompt,
+                image=pil_img,
+                mask_image=pil_mask,
+                height=res,
+                width=res,
+                num_inference_steps=20,
+                generator=generator,
+            ).images[0]
 
         save_path = val_dir / f"epoch{epoch:04d}_step{step:07d}_{i}.png"
         out.save(save_path)
@@ -323,6 +351,7 @@ def main(cfg) -> None:
 
     global_step = 0
     first_epoch = 0
+    resume_step = 0  # optimizer steps already done within first_epoch
 
     # ── Resume ───────────────────────────────────────────────────────────
     if cfg.training.resume_from_checkpoint:
@@ -336,9 +365,23 @@ def main(cfg) -> None:
 
         if ckpt:
             accelerator.load_state(ckpt)
-            global_step = int(Path(ckpt).name.split("-")[1])
-            first_epoch = global_step // num_update_steps_per_epoch
-            logger.info(f"Resumed from checkpoint: {ckpt} (global step {global_step})")
+            # Load precise step/epoch from saved JSON; fall back to folder-name parsing
+            state_file = Path(ckpt) / "training_state.json"
+            if state_file.exists():
+                with open(state_file) as fh:
+                    saved_state = json.load(fh)
+                global_step = saved_state["global_step"]
+                first_epoch = saved_state["epoch"]
+            else:
+                global_step = int(Path(ckpt).name.split("-")[1])
+                first_epoch = global_step // num_update_steps_per_epoch
+            # How many optimizer steps of first_epoch were already done
+            resume_step = global_step - first_epoch * num_update_steps_per_epoch
+            logger.info(
+                f"Resumed from checkpoint: {ckpt} "
+                f"(global_step={global_step}, epoch={first_epoch}, "
+                f"resume_step={resume_step}/{num_update_steps_per_epoch})"
+            )
 
     # ── Training loop ────────────────────────────────────────────────────
     progress_bar = tqdm(
@@ -351,7 +394,21 @@ def main(cfg) -> None:
         unet.train()
         train_loss = 0.0
 
-        for step, batch in enumerate(train_loader):
+        # When resuming mid-epoch, skip the batches already processed so we
+        # don't redo gradient updates that are already baked into the checkpoint.
+        batches_to_skip = resume_step * cfg.training.gradient_accumulation_steps if epoch == first_epoch else 0
+        if batches_to_skip > 0:
+            logger.info(f"  Epoch {epoch}: skipping {batches_to_skip} already-processed batches …")
+            if hasattr(accelerator, "skip_first_batches"):
+                active_loader = accelerator.skip_first_batches(train_loader, batches_to_skip)
+            else:
+                active_loader = iter(train_loader)
+                for _ in range(batches_to_skip):
+                    next(active_loader, None)
+        else:
+            active_loader = train_loader
+
+        for step, batch in enumerate(active_loader):
             with accelerator.accumulate(unet):
                 # Encode images to latent space
                 latents = vae.encode(
@@ -436,6 +493,10 @@ def main(cfg) -> None:
                             cfg.training.output_dir, f"checkpoint-{global_step}"
                         )
                         accelerator.save_state(ckpt_dir)
+                        # Persist step/epoch so resume is reliable even if the
+                        # folder is moved or the name format changes.
+                        with open(os.path.join(ckpt_dir, "training_state.json"), "w") as fh:
+                            json.dump({"global_step": global_step, "epoch": epoch}, fh)
                         # Keep only the 3 most recent checkpoints
                         ckpts = sorted(
                             [
@@ -453,7 +514,7 @@ def main(cfg) -> None:
                             accelerator, unet, vae, text_encoder, tokenizer,
                             noise_scheduler, pretrained, weight_dtype, cfg
                         )
-                        log_validation(pipeline, cfg, accelerator, epoch, global_step)
+                        log_validation(pipeline, cfg, accelerator, epoch, global_step, weight_dtype)
                         del pipeline
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}

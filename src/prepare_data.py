@@ -161,7 +161,11 @@ def split_dataset(
     for split, paths in splits.items():
         out_dir = Path(output_dir) / split / "images"
         out_dir.mkdir(parents=True, exist_ok=True)
-        for src in tqdm(paths, desc=f"Copying {split}"):
+        to_copy = [src for src in paths if not (out_dir / src.name).exists()]
+        skipped = len(paths) - len(to_copy)
+        if skipped:
+            print(f"  [{split}] Skipping {skipped} already-copied images.")
+        for src in tqdm(to_copy, desc=f"Copying {split}"):
             shutil.copy2(src, out_dir / src.name)
 
     print(f"Split complete – train: {len(splits['train'])}, val: {len(splits['val'])}")
@@ -255,47 +259,35 @@ def _caption_florence2(
     device: str,
     batch_size: int,
 ) -> dict:
-    """Caption images with Florence-2 (microsoft/Florence-2-large).
-
-    ~8 GB VRAM. Returns dense, region-aware captions – well-suited for
-    interior scenes where multiple furniture objects need to be described.
-    Uses the ``<MORE_DETAILED_CAPTION>`` task token for richer output.
-
-    Compatibility note
-    ------------------
-    * ``transformers < 4.45`` – Florence-2 requires ``trust_remote_code=True``.
-    * ``transformers >= 4.45`` – Florence-2 is natively supported; passing
-      ``trust_remote_code=True`` causes an architecture mismatch (the custom
-      remote code references an old class that conflicts with the built-in one),
-      producing the "model of type florence2 to instantiate model of type ``"
-      error.  ``trust_remote_code`` must therefore be omitted on these versions.
-    * ``transformers >= 4.48`` – ``torch_dtype`` is deprecated; use ``dtype``.
-
-    The loading logic below detects the installed version and selects the
-    correct kwargs automatically.
-    """
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        # Sử dụng Auto class để linh hoạt hơn
+        from transformers import AutoProcessor, AutoModelForCausalLM
     except ImportError as exc:
-        raise ImportError("pip install transformers torch") from exc
+        raise ImportError("pip install transformers torch einops timm") from exc
 
     model_id = "microsoft/Florence-2-large"
-    print(f"Loading Florence-2 processor and model ({model_id}) …")
+    print(f"Loading Florence-2 (An toàn) từ {model_id} …")
 
-    _dtype = torch.float16 if device != "cpu" else torch.float32
-    # transformers >= 4.45: native Florence-2 support; trust_remote_code must
-    # NOT be passed (it causes an architecture-class mismatch and a crash).
-    _native_florence2: bool = _transformers_version() >= (4, 45)
+    _dtype = torch.float16 if device != "cuda" else torch.float32
 
-    processor = AutoProcessor.from_pretrained(
-        model_id,
-        trust_remote_code=not _native_florence2,
-    )
+    # SỬA LỖI TẠI ĐÂY:
+    # Luôn sử dụng trust_remote_code=True cho cả Model và Processor 
+    # để đảm bảo chúng dùng chung kiến trúc "custom" từ HuggingFace, 
+    # tránh lỗi 'image_token' của bản native.
+    
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    
     model_kwargs = _torch_dtype_kwarg(_dtype)
-    if not _native_florence2:
-        model_kwargs["trust_remote_code"] = True
-    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs).to(device)
+    model_kwargs["trust_remote_code"] = True
+    
+    # Florence-2 chạy tốt nhất với Flash Attention nếu có, 
+    # nhưng "eager" là an toàn nhất cho mọi cấu hình.
+    model_kwargs["attn_implementation"] = "eager" 
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, **model_kwargs
+    ).to(device)
     model.eval()
 
     task_token = "<MORE_DETAILED_CAPTION>"
@@ -304,28 +296,36 @@ def _caption_florence2(
     for i in tqdm(range(0, len(image_paths), batch_size), desc="Captioning (Florence-2)"):
         batch = image_paths[i : i + batch_size]
         images = [Image.open(p).convert("RGB") for p in batch]
+        
         inputs = processor(
             text=[task_token] * len(images),
             images=images,
             return_tensors="pt",
             padding=True,
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Chuyển dữ liệu sang GPU/CPU
+        inputs = {k: v.to(device).to(_dtype) if v.dtype == torch.float32 else v.to(device) 
+                 for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+        
         with torch.no_grad():
-            ids = model.generate(
-                **inputs,
-                max_new_tokens=128,
-                num_beams=3,
-                early_stopping=True,
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                num_beams=3
             )
-        for path, out_ids, image in zip(batch, ids, images):
-            decoded = processor.post_process_generation(
-                processor.batch_decode(out_ids.unsqueeze(0), skip_special_tokens=False)[0],
+            
+        for path, out_ids, image in zip(batch, generated_ids, images):
+            generated_text = processor.batch_decode(out_ids.unsqueeze(0), skip_special_tokens=False)[0]
+            
+            # Post-process để lấy nội dung text sạch
+            parsed_answer = processor.post_process_generation(
+                generated_text,
                 task=task_token,
-                image_size=(image.width, image.height),
+                image_size=(image.width, image.height)
             )
-            caption = decoded.get(task_token, "").strip()
-            captions[path.name] = caption
+            captions[path.name] = parsed_answer[task_token]
 
     return captions
 
@@ -373,16 +373,29 @@ def generate_captions(
             continue
 
         paths = _image_paths(images_dir)
-        print(f"\n[{split}] {len(paths)} images – captioner: {captioner}")
-
-        if captioner == "blip":
-            captions = _caption_blip(paths, device, batch_size, max_new_tokens)
-        elif captioner == "blip2":
-            captions = _caption_blip2(paths, device, batch_size, max_new_tokens, interior_prefix)
-        else:
-            captions = _caption_florence2(paths, device, batch_size)
-
         out_path = root / split / "captions.json"
+
+        # Resume: load existing captions and skip already-processed images
+        existing_captions: dict = {}
+        if out_path.exists():
+            with open(out_path, "r", encoding="utf-8") as fh:
+                existing_captions = json.load(fh)
+        pending = [p for p in paths if p.name not in existing_captions]
+        skipped = len(paths) - len(pending)
+        print(f"\n[{split}] {len(paths)} images – captioner: {captioner}")
+        if skipped:
+            print(f"  Resuming: skipping {skipped} already-captioned images; {len(pending)} remaining.")
+
+        new_captions: dict = {}
+        if pending:
+            if captioner == "blip":
+                new_captions = _caption_blip(pending, device, batch_size, max_new_tokens)
+            elif captioner == "blip2":
+                new_captions = _caption_blip2(pending, device, batch_size, max_new_tokens, interior_prefix)
+            else:
+                new_captions = _caption_florence2(pending, device, batch_size)
+
+        captions = {**existing_captions, **new_captions}
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(captions, fh, ensure_ascii=False, indent=2)
         print(f"  Saved {len(captions)} captions → {out_path}")
@@ -462,6 +475,9 @@ def _mask_sam(
         mask = _pick_best_mask(anns, w // 2, h // 2)
         if mask is not None:
             cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), mask)
+        else:
+            # Save an empty mask so the resume logic won't reprocess this image
+            cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), np.zeros((h, w), dtype=np.uint8))
 
 
 def _mask_sam2(
@@ -504,6 +520,9 @@ def _mask_sam2(
         mask = _pick_best_mask(anns, w // 2, h // 2)
         if mask is not None:
             cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), mask)
+        else:
+            # Save an empty mask so the resume logic won't reprocess this image
+            cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), np.zeros((h, w), dtype=np.uint8))
 
 
 def _mask_grounded_sam(
@@ -554,12 +573,25 @@ def _mask_grounded_sam(
     caption = " . ".join(labels) + " ."
 
     print("Loading GroundingDINO model …")
-    # These paths follow the default layout after cloning the GroundingDINO repo
-    # (https://github.com/IDEA-Research/GroundingDINO).  The groundingdino-py
-    # package resolves them relative to its installed location, so you do NOT
-    # need to create them manually – they are provided here as documentation.
-    gd_config = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-    gd_weights = "weights/groundingdino_swint_ogc.pth"
+    # Resolve config from the installed groundingdino-py package (no local clone needed).
+    import importlib.util as _ilu
+    _gd_pkg = Path(_ilu.find_spec("groundingdino").origin).parent
+    gd_config = str(_gd_pkg / "config" / "GroundingDINO_SwinT_OGC.py")
+
+    # Weights: look in project-local weights/ directory; auto-download if missing.
+    _weights_dir = Path(__file__).parent.parent / "weights"
+    gd_weights = str(_weights_dir / "groundingdino_swint_ogc.pth")
+    if not Path(gd_weights).exists():
+        import urllib.request
+        _weights_dir.mkdir(parents=True, exist_ok=True)
+        _url = (
+            "https://github.com/IDEA-Research/GroundingDINO/releases/"
+            "download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+        )
+        print(f"  GroundingDINO weights not found. Downloading to {gd_weights} …")
+        urllib.request.urlretrieve(_url, gd_weights)
+        print("  Download complete.")
+
     gdino = GroundingDINO(
         model_config_path=gd_config,
         model_checkpoint_path=gd_weights,
@@ -578,13 +610,17 @@ def _mask_grounded_sam(
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
         # Detect furniture bounding boxes with GroundingDINO
-        detections = gdino.predict_with_caption(
+        # predict_with_caption returns (Detections, phrases) tuple
+        detections, _phrases = gdino.predict_with_caption(
             image=image_bgr,
             caption=caption,
             box_threshold=box_threshold,
             text_threshold=text_threshold,
         )
         if len(detections.xyxy) == 0:
+            # Save an empty mask so the resume logic won't reprocess this image
+            empty_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+            cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), empty_mask)
             continue
 
         # Predict SAM masks for all detected boxes
@@ -672,8 +708,9 @@ def _mask_oneformer(
             if any(t in label_name or label_name in t for t in target_set):
                 combined[seg_map == seg_info["id"]] = 255
 
-        if combined.any():
-            cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), combined)
+        # Always write the mask (empty = all-black when no furniture detected),
+        # so the resume logic won't reprocess this image on the next run.
+        cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), combined)
 
 
 def generate_masks(
@@ -744,7 +781,17 @@ def generate_masks(
         masks_dir.mkdir(parents=True, exist_ok=True)
 
         paths = _image_paths(images_dir)
+
+        # Resume: skip images whose mask file already exists
+        pending = [p for p in paths if not (masks_dir / (p.stem + ".png")).exists()]
+        skipped = len(paths) - len(pending)
         print(f"\n[{split}] {len(paths)} images – masker: {masker}")
+        if skipped:
+            print(f"  Resuming: skipping {skipped} already-masked images; {len(pending)} remaining.")
+        if not pending:
+            print(f"  All masks already exist, nothing to do.")
+            continue
+        paths = pending
 
         if masker == "sam":
             _mask_sam(
@@ -802,6 +849,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("--device", default="cuda")
     p_cap.add_argument("--batch_size", type=int, default=8)
     p_cap.add_argument("--max_new_tokens", type=int, default=60)
+    p_cap.add_argument(
+        "--interior_prefix",
+        default="An interior design photo of",
+        help="Conditional text prefix for BLIP-2 prompted generation (blip2 only)",
+    )
 
     # ── mask ───────────────────────────────────────────────────────────────
     p_mask = sub.add_parser(
@@ -867,6 +919,7 @@ def main() -> None:
             device=args.device,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
+            interior_prefix=args.interior_prefix,
         )
 
     elif args.command == "mask":
