@@ -32,6 +32,7 @@ python src/inference.py \\
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import List, Optional
@@ -66,7 +67,40 @@ def _build_pipeline(
     dtype: torch.dtype,
     enable_xformers: bool,
 ):
-    """Load the inpainting pipeline (optionally with LoRA adapters)."""
+    """Load the inpainting pipeline (optionally with LoRA adapters).
+
+    When *model_dir* points to a LoRA training output directory (i.e. it
+    contains ``training_metadata.json`` but no ``model_index.json``), the
+    function automatically resolves the base model and LoRA adapter path so
+    that callers do not need to pass ``--lora_dir`` explicitly.
+    """
+    model_path = Path(model_dir)
+
+    # ── Detect LoRA-only output directory ────────────────────────────────
+    if model_path.is_dir() and not (model_path / "model_index.json").exists():
+        metadata_file = model_path / "training_metadata.json"
+        if metadata_file.exists():
+            with open(metadata_file) as f:
+                metadata = json.load(f)
+            base_model = metadata["base_model"]
+            # Auto-set lora_dir from metadata only when the caller did not
+            # provide an explicit --lora_dir argument.
+            if lora_dir is None and "lora_dir" in metadata:
+                lora_dir = str(model_path / metadata["lora_dir"])
+            print(
+                f"Detected LoRA output directory. "
+                f"Loading base model: {base_model}"
+            )
+            model_dir = base_model
+        else:
+            raise OSError(
+                f"No 'model_index.json' found in '{model_dir}'. "
+                "If this is a LoRA training output directory, make sure it "
+                "contains 'training_metadata.json' (produced by train.py). "
+                "Alternatively, pass the base HuggingFace model ID via "
+                "--model_dir and the adapter path via --lora_dir."
+            )
+
     from diffusers import StableDiffusionInpaintPipeline
 
     pipe = StableDiffusionInpaintPipeline.from_pretrained(

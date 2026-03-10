@@ -529,9 +529,17 @@ def main(cfg) -> None:
         unet_unwrapped = accelerator.unwrap_model(unet)
 
         if cfg.lora.enabled:
+            lora_subdir = "unet_lora"
             unet_unwrapped.save_pretrained(
-                os.path.join(cfg.training.output_dir, "unet_lora")
+                os.path.join(cfg.training.output_dir, lora_subdir)
             )
+            # Save metadata so inference.py can locate the base model automatically
+            metadata = {
+                "base_model": pretrained,
+                "lora_dir": lora_subdir,
+            }
+            with open(os.path.join(cfg.training.output_dir, "training_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
         else:
             pipeline = StableDiffusionInpaintPipeline.from_pretrained(
                 pretrained,
