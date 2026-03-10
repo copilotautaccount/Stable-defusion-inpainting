@@ -1,117 +1,218 @@
 # Stable Diffusion Inpainting
 
-Dự án này sử dụng mô hình **Stable Diffusion Inpainting** để tự động điền (inpaint) vùng bị che trong ảnh dựa trên mô tả văn bản.
+Dự án này cho phép bạn **fine-tune** (tinh chỉnh) và **chạy inference** với mô hình Stable Diffusion Inpainting trên bộ dữ liệu riêng của mình.
 
 ---
 
-## 📄 File `inference.py` — Giải thích chi tiết
+## Mục lục
 
-File `inference.py` là tập lệnh suy luận (inference) chính. Nó thực hiện toàn bộ quy trình từ tải mô hình đến xuất ảnh kết quả.
+- [Yêu cầu](#yêu-cầu)
+- [Cấu trúc dự án](#cấu-trúc-dự-án)
+- [File `inference.py` — Giải thích chi tiết](#file-inferencepy--giải-thích-chi-tiết)
+- [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
+- [Huấn luyện (train.py)](#huấn-luyện-trainpy)
+- [Chạy Inference](#chạy-inference)
+- [Lỗi thường gặp](#lỗi-thường-gặp)
 
-### Cấu trúc file
+---
 
-| Thành phần | Mô tả |
+## Yêu cầu
+
+```bash
+pip install -r requirements.txt
+```
+
+Cần GPU NVIDIA có CUDA (khuyến nghị ≥ 16 GB VRAM để huấn luyện ở độ phân giải 512×512).  
+Inference có thể chạy với GPU 6 GB VRAM hoặc CPU (chậm hơn).
+
+---
+
+## Cấu trúc dự án
+
+```
+.
+├── dataset.py       # PyTorch Dataset đọc ảnh và mask cho quá trình huấn luyện
+├── train.py         # Script fine-tune mô hình Stable Diffusion Inpainting
+├── inference.py     # Script chạy inference (tạo ảnh inpainting)
+├── requirements.txt # Các thư viện Python cần thiết
+└── README.md
+```
+
+---
+
+## File `inference.py` — Giải thích chi tiết
+
+File `inference.py` là script dùng để **chạy mô hình tạo ảnh inpainting**, hỗ trợ cả mô hình base lẫn mô hình đã được fine-tune.
+
+### Các tính năng chính
+
+| Tính năng | Mô tả |
 |---|---|
-| `load_image(path)` | Tải ảnh đầu vào từ đường dẫn và chuyển sang định dạng RGB |
-| `load_mask(path)` | Tải ảnh mặt nạ (mask) và chuyển sang ảnh xám (greyscale) |
-| `get_device()` | Tự động chọn thiết bị: GPU (`cuda`) nếu có, ngược lại dùng CPU |
-| `load_pipeline(model_id, device)` | Tải pipeline Stable Diffusion Inpainting từ Hugging Face (hoặc từ cache) |
-| `run_inpainting(...)` | Hàm chính thực hiện quá trình inpainting: resize ảnh, chạy mô hình, trả về ảnh kết quả |
-| `parse_args()` | Phân tích tham số dòng lệnh (CLI arguments) |
-| `main()` | Hàm điều phối toàn bộ luồng xử lý |
+| **Single-image mode** | Xử lý một cặp ảnh + mask duy nhất |
+| **Batch directory mode** | Xử lý toàn bộ thư mục ảnh và mask cùng lúc |
+| **LoRA weights** | Hỗ trợ tải thêm LoRA adapter để cải thiện kết quả |
+| **Fine-tuned model** | Tải model đã được fine-tune bởi `train.py` |
+| **Base model** | Dùng trực tiếp model `runwayml/stable-diffusion-inpainting` mà không cần fine-tune |
 
-### Quy ước ảnh mặt nạ (mask)
+### Cấu trúc hàm trong `inference.py`
+
+| Hàm | Mô tả |
+|---|---|
+| `load_pipeline(model_path, device, dtype, lora_weights)` | Tải pipeline Stable Diffusion Inpainting từ thư mục local hoặc Hugging Face. Tự động bật `attention_slicing` để tiết kiệm VRAM. |
+| `prepare_inputs(image_path, mask_path, image_size)` | Tải và resize ảnh + mask. Mask được nhị phân hoá: pixel > 127 = vùng cần inpaint. |
+| `collect_image_mask_pairs(image_dir, mask_dir)` | Ghép cặp ảnh và mask theo **tên file** (stem). Cảnh báo nếu có ảnh thiếu mask tương ứng. |
+| `run_inference(pipe, image, mask, ...)` | Chạy pipeline trên một cặp ảnh/mask và trả về danh sách ảnh kết quả. |
+| `parse_args()` | Phân tích toàn bộ tham số dòng lệnh. |
+| `main()` | Điều phối toàn bộ luồng: validate tham số → tải model → xử lý ảnh → lưu kết quả. |
+
+### Quy ước ảnh mask
 
 | Màu pixel | Ý nghĩa |
 |---|---|
 | **Trắng (255)** | Vùng cần inpaint — mô hình sẽ tạo nội dung mới tại đây |
 | **Đen (0)** | Vùng giữ nguyên — mô hình không thay đổi vùng này |
 
-### Các tham số chính của `run_inpainting`
+---
 
-| Tham số | Mặc định | Ý nghĩa |
-|---|---|---|
-| `prompt` | *(bắt buộc)* | Mô tả văn bản về nội dung cần tạo trong vùng mask |
-| `negative_prompt` | `""` | Mô tả những gì **không** muốn xuất hiện trong ảnh |
-| `width` / `height` | `512` | Kích thước ảnh đầu ra (phải là bội số của 8) |
-| `num_inference_steps` | `50` | Số bước khử nhiễu — nhiều hơn → chất lượng cao hơn nhưng chậm hơn |
-| `guidance_scale` | `7.5` | Mức độ tuân theo prompt (thường từ 5 đến 15) |
-| `seed` | `42` | Seed ngẫu nhiên để tái tạo kết quả |
+## Chuẩn bị dữ liệu
+
+Tổ chức dữ liệu theo cấu trúc sau:
+
+```
+data/
+├── images/          # Ảnh RGB gốc  (*.png / *.jpg)
+├── masks/           # Ảnh mask nhị phân  (*.png / *.jpg)
+│                    #   Trắng (255) = vùng cần fill
+│                    #   Đen   (0)  = vùng giữ nguyên
+└── prompts.txt      # (tuỳ chọn) Mỗi dòng là một text prompt tương ứng với ảnh
+```
+
+- Ảnh và mask được **ghép cặp theo thứ tự sort** (khi dùng `train.py`).
+- Khi dùng `inference.py` chế độ batch, ảnh và mask được ghép theo **tên file** (stem).
+- Nếu thiếu `prompts.txt`, toàn bộ ảnh sẽ được huấn luyện với prompt rỗng.
 
 ---
 
-## 🚀 Hướng dẫn chạy file `inference.py`
-
-### 1. Yêu cầu hệ thống
-
-- Python 3.8 trở lên
-- GPU NVIDIA với CUDA (khuyến nghị, ít nhất 6 GB VRAM) hoặc CPU (chậm hơn)
-
-### 2. Cài đặt thư viện
+## Huấn luyện (`train.py`)
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install diffusers transformers accelerate Pillow
+python train.py \
+    --pretrained_model_name_or_path runwayml/stable-diffusion-inpainting \
+    --data_dir ./data \
+    --output_dir ./output \
+    --num_train_epochs 10 \
+    --train_batch_size 2 \
+    --learning_rate 1e-5 \
+    --image_size 512 \
+    --save_steps 500 \
+    --mixed_precision fp16
 ```
 
-> **Lưu ý:** Nếu chỉ dùng CPU, cài torch bình thường:
-> ```bash
-> pip install torch torchvision
-> ```
+| Tham số | Mặc định | Mô tả |
+|---|---|---|
+| `--pretrained_model_name_or_path` | `runwayml/stable-diffusion-inpainting` | Model base (HF id hoặc đường dẫn local) |
+| `--data_dir` | *(bắt buộc)* | Thư mục gốc của bộ dữ liệu |
+| `--output_dir` | `./output` | Nơi lưu checkpoints và model cuối |
+| `--image_size` | `512` | Độ phân giải huấn luyện |
+| `--train_batch_size` | `2` | Batch size trên mỗi GPU |
+| `--num_train_epochs` | `10` | Số epoch huấn luyện |
+| `--learning_rate` | `1e-5` | Learning rate ban đầu |
+| `--save_steps` | `500` | Lưu checkpoint mỗi N bước |
+| `--mixed_precision` | `no` | `fp16` / `bf16` / `no` |
+| `--gradient_accumulation_steps` | `1` | Tích luỹ gradient trước khi update |
+| `--use_8bit_adam` | `False` | Bật 8-bit Adam (cần `bitsandbytes`) |
 
-### 3. Chuẩn bị file đầu vào
+Sau khi huấn luyện, toàn bộ pipeline (VAE, UNet đã fine-tune, text encoder, tokenizer) sẽ được lưu vào `--output_dir` theo định dạng Diffusers và có thể load trực tiếp cho inference.
 
-Bạn cần hai file ảnh:
+---
 
-- **`input.png`** — Ảnh gốc mà bạn muốn chỉnh sửa.
-- **`mask.png`** — Ảnh mặt nạ cùng kích thước với ảnh gốc:
-  - Tô **trắng** (`255`) vào vùng muốn inpaint.
-  - Giữ **đen** (`0`) cho vùng muốn giữ nguyên.
+## Chạy Inference
 
-### 4. Chạy lệnh cơ bản
+### 1. Cài đặt thư viện
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Chế độ một ảnh (Single-image)
+
+Dùng model đã fine-tune:
 
 ```bash
 python inference.py \
-    --image input.png \
-    --mask  mask.png  \
-    --prompt "a beautiful garden with flowers"
+    --model_path ./output \
+    --image ./data/images/photo.png \
+    --mask  ./data/masks/photo.png \
+    --prompt "a beautiful garden" \
+    --output_dir ./results
 ```
 
-Kết quả sẽ được lưu tại `output.png` (mặc định).
-
-### 5. Tùy chỉnh nâng cao
+Dùng thẳng model base (không cần fine-tune):
 
 ```bash
 python inference.py \
-    --image       input.png \
-    --mask        mask.png  \
-    --prompt      "a modern kitchen with marble countertops" \
-    --negative-prompt "blurry, low quality, distorted" \
-    --output      result.png \
-    --width       512 \
-    --height      512 \
-    --steps       75 \
-    --guidance-scale 9.0 \
-    --seed        1234
+    --model_path runwayml/stable-diffusion-inpainting \
+    --image ./photo.png \
+    --mask  ./mask.png \
+    --prompt "a cozy living room"
 ```
 
-### 6. Danh sách đầy đủ các tham số CLI
+### 3. Chế độ batch (nhiều ảnh cùng lúc)
 
-| Tham số | Bắt buộc | Mặc định | Mô tả |
-|---|---|---|---|
-| `--image` | ✅ | — | Đường dẫn ảnh đầu vào |
-| `--mask` | ✅ | — | Đường dẫn ảnh mặt nạ |
-| `--prompt` | ✅ | — | Mô tả văn bản cho vùng cần tạo |
-| `--output` | | `output.png` | Đường dẫn file kết quả |
-| `--model` | | `runwayml/stable-diffusion-inpainting` | ID mô hình trên Hugging Face |
-| `--negative-prompt` | | `""` | Mô tả nội dung không muốn xuất hiện |
-| `--width` | | `512` | Chiều rộng ảnh đầu ra |
-| `--height` | | `512` | Chiều cao ảnh đầu ra |
-| `--steps` | | `50` | Số bước khử nhiễu |
-| `--guidance-scale` | | `7.5` | Mức độ tuân theo prompt |
-| `--seed` | | `42` | Seed ngẫu nhiên |
+```bash
+python inference.py \
+    --model_path ./output \
+    --image_dir ./data/images \
+    --mask_dir  ./data/masks \
+    --prompt "a beautiful garden" \
+    --output_dir ./results
+```
 
-### 7. Xem trợ giúp
+Ảnh và mask được ghép cặp theo **tên file** (ví dụ `photo.png` ↔ `photo.png`).
+
+### 4. Nâng cao — với LoRA và tuỳ chỉnh đầy đủ
+
+```bash
+python inference.py \
+    --model_path     ./output \
+    --lora_weights   ./lora_adapter \
+    --image          ./photo.png \
+    --mask           ./mask.png \
+    --prompt         "a modern kitchen with marble countertops" \
+    --negative_prompt "blurry, low quality, distorted" \
+    --num_inference_steps 75 \
+    --guidance_scale 9.0 \
+    --strength       0.9 \
+    --num_images_per_prompt 3 \
+    --seed           1234 \
+    --output_dir     ./results \
+    --image_size     512 \
+    --mixed_precision fp16
+```
+
+### 5. Danh sách đầy đủ tham số `inference.py`
+
+| Tham số | Mặc định | Mô tả |
+|---|---|---|
+| `--model_path` | `./output` | Thư mục model fine-tune hoặc HF model id |
+| `--lora_weights` | `None` | Thư mục chứa LoRA adapter (tuỳ chọn) |
+| `--image` | `None` | Ảnh gốc (chế độ single-image) |
+| `--mask` | `None` | Ảnh mask (chế độ single-image) |
+| `--image_dir` | `None` | Thư mục ảnh (chế độ batch) |
+| `--mask_dir` | `None` | Thư mục mask (chế độ batch) |
+| `--prompt` | `""` | Text prompt mô tả nội dung cần tạo |
+| `--negative_prompt` | `"low quality, blurry, distorted"` | Negative prompt |
+| `--num_inference_steps` | `50` | Số bước khử nhiễu |
+| `--guidance_scale` | `7.5` | Mức độ tuân theo prompt (CFG scale) |
+| `--strength` | `1.0` | Mức độ biến đổi vùng mask (0–1) |
+| `--num_images_per_prompt` | `1` | Số ảnh tạo ra cho mỗi đầu vào |
+| `--seed` | `None` | Seed ngẫu nhiên để tái tạo kết quả |
+| `--output_dir` | `./results` | Thư mục lưu ảnh kết quả |
+| `--image_size` | `512` | Độ phân giải inference (hình vuông) |
+| `--device` | tự động | `cuda` / `cpu` |
+| `--mixed_precision` | `fp16` | `fp16` / `bf16` / `no` |
+
+### 6. Xem trợ giúp
 
 ```bash
 python inference.py --help
@@ -119,24 +220,13 @@ python inference.py --help
 
 ---
 
-## 🔄 Luồng xử lý tổng quát
-
-```
-Ảnh gốc (input.png)  ─┐
-                        ├──► run_inpainting() ──► output.png
-Ảnh mask (mask.png)  ─┘         ▲
-                                 │
-                         Mô hình SD Inpainting
-                         + Text Prompt
-```
-
----
-
-## ❓ Lỗi thường gặp
+## Lỗi thường gặp
 
 | Lỗi | Nguyên nhân | Giải pháp |
 |---|---|---|
-| `CUDA out of memory` | VRAM không đủ | Thêm `--width 512 --height 512` hoặc dùng CPU |
-| `OSError: ... not found` | Chưa có kết nối internet để tải mô hình | Kết nối mạng và chạy lại lần đầu để tải cache |
-| Ảnh đầu ra bị mờ | Số bước quá ít | Tăng `--steps` lên 75–100 |
-| Kết quả không theo ý | `guidance_scale` chưa phù hợp | Thử `--guidance-scale` từ 7 đến 12 |
+| `CUDA out of memory` | VRAM không đủ | Dùng `--mixed_precision fp16` hoặc giảm `--image_size` |
+| `ValueError: Provide either --image + --mask ...` | Không truyền đủ tham số đầu vào | Truyền `--image` + `--mask` hoặc `--image_dir` + `--mask_dir` |
+| `FileNotFoundError: No matching image/mask pairs` | Tên file ảnh và mask không khớp nhau | Đặt tên file ảnh và mask giống nhau (chỉ khác extension) |
+| `OSError: model not found` | Chưa có kết nối internet để tải model | Kết nối mạng và chạy lại lần đầu để tải cache |
+| Ảnh kết quả bị mờ | Số bước quá ít | Tăng `--num_inference_steps` lên 75–100 |
+| Kết quả không theo prompt | `guidance_scale` chưa phù hợp | Thử `--guidance_scale` từ 7 đến 12 |
