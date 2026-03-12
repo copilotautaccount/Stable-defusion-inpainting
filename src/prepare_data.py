@@ -646,8 +646,11 @@ def _mask_sam3(
                 continue
             for m in masks:
                 mask_arr = np.asarray(m, dtype=bool)
-                if mask_arr.ndim == 3:
+                # Flatten to 2-D: SAM3 may return (1, H, W) or (H, W).
+                while mask_arr.ndim > 2:
                     mask_arr = mask_arr[0]
+                if mask_arr.ndim != 2:
+                    continue
                 combined |= mask_arr.astype(np.uint8) * 255
 
         # Always write the mask (empty = all-black when no furniture detected),
