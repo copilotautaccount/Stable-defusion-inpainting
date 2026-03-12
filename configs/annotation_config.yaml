@@ -65,10 +65,13 @@ captioning:
 #  ─────────────────────────────────────────────────────────────────────────────
 #  sam            Automatic (centre)    ~7 GB  medium    requires .pth download
 #  sam2           Automatic (centre)    ~8 GB  high      no download needed
+#  sam3           Text-prompted         ~10 GB very high concept-aware, best overall
 #  grounded_sam   Text-prompted         ~10 GB very high recommended for interiors ← default
 #  oneformer      Semantic segmentation ~12 GB high      ADE20K 150 categories
 #
 # Recommendation for interior design:
+#   • sam3          – best overall quality; text-prompted concept segmentation
+#                     understands furniture labels natively; no extra deps
 #   • grounded_sam  – most accurate for furniture; specify labels you want to
 #                     mask ("sofa,chair,table,bed,cabinet,lamp")
 #   • oneformer     – good when you want semantic category masks (all sofas, all
@@ -77,6 +80,10 @@ captioning:
 #   • sam           – use only if you already have the .pth checkpoint
 #
 # CLI examples:
+#   python src/prepare_data.py mask --dataset_dir data/interior \
+#       --masker sam3 \
+#       --furniture_labels "sofa,armchair,chair,table,coffee table,bed,cabinet,lamp"
+#
 #   python src/prepare_data.py mask --dataset_dir data/interior \
 #       --masker grounded_sam \
 #       --furniture_labels "sofa,armchair,chair,table,coffee table,bed,cabinet,lamp" \
@@ -119,6 +126,20 @@ masking:
         SAM 2 with improved boundary accuracy. Loaded directly from
         HuggingFace – no manual download needed. Also supports video
         sequences if your dataset contains room walk-throughs.
+
+    sam3:
+      approach: "Text-prompted concept segmentation"
+      hf_id: "facebook/sam3"
+      vram_gb: 10
+      notes: >
+        SAM 3 (Segment Anything with Concepts) supports open-vocabulary
+        text-prompted segmentation. Each furniture label is used as a text
+        prompt to find all matching instances.  Produces high-quality masks
+        that align well with caption descriptions because both understand
+        furniture concepts by name.  No manual checkpoint download – weights
+        are fetched from HuggingFace automatically (requires authentication
+        via ``huggingface-cli login``).
+        Install with: pip install sam3
 
     grounded_sam:
       approach: "Text-prompted detection (GroundingDINO) + SAM segmentation"

@@ -27,6 +27,9 @@ segment-anything>=1.0
 #   SAM 2 (Meta, loads from HuggingFace automatically):
 #   pip install 'git+https://github.com/facebookresearch/sam2.git'
 #
+#   SAM 3 (Meta, text-prompted concept segmentation, loads from HuggingFace):
+#   pip install sam3
+#
 #   Grounded-SAM (GroundingDINO + SAM, text-prompted furniture detection):
 #   pip install groundingdino-py
 #   NOTE: groundingdino-py requires a CUDA-capable GPU and torch with CUDA.
