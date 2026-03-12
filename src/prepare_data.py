@@ -11,6 +11,7 @@ Masking models
 --------------
   sam          Meta SAM ViT-H (local .pth checkpoint)   ~7 GB VRAM  automatic segments
   sam2         facebook/sam2-hiera-large (HuggingFace)  ~8 GB VRAM  improved SAM, no download
+  sam3         facebook/sam3 (text-prompted)             ~10 GB VRAM concept-aware segmentation
   grounded_sam GroundingDINO + SAM (text-prompted)      ~10 GB VRAM furniture-aware (recommended)
   oneformer    shi-labs/oneformer_ade20k_swin_large      ~12 GB VRAM semantic segmentation
 
@@ -31,7 +32,7 @@ python src/prepare_data.py caption \\
     --dataset_dir data/interior \\
     --captioner   florence2
 
-# 3. Auto-generate object masks  (choose --masker sam | sam2 | grounded_sam | oneformer)
+# 3. Auto-generate object masks  (choose --masker sam | sam2 | sam3 | grounded_sam | oneformer)
 python src/prepare_data.py mask \\
     --dataset_dir data/interior \\
     --masker      grounded_sam \\
@@ -45,6 +46,11 @@ python src/prepare_data.py mask \\
 python src/prepare_data.py mask \\
     --dataset_dir data/interior \\
     --masker      sam2
+
+python src/prepare_data.py mask \\
+    --dataset_dir data/interior \\
+    --masker      sam3 \\
+    --furniture_labels "sofa,chair,table,bed,cabinet,lamp"
 
 python src/prepare_data.py mask \\
     --dataset_dir data/interior \\
@@ -581,6 +587,74 @@ def _mask_sam2(
             cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), np.zeros((h, w), dtype=np.uint8))
 
 
+def _mask_sam3(
+    image_paths: List[Path],
+    masks_dir: Path,
+    device: str,
+    furniture_labels: str,
+) -> None:
+    """Generate masks with SAM 3 (Segment Anything Model 3) using text prompts.
+
+    SAM 3 is Meta's third-generation segmentation model supporting
+    open-vocabulary, text-prompted concept segmentation.  Unlike SAM / SAM 2
+    (which rely on a centre-heuristic), SAM 3 accepts a natural-language
+    description of the objects to segment, producing masks for every instance
+    that matches the concept.
+
+    Model: ``facebook/sam3`` (~10 GB VRAM).
+
+    Requires:
+        pip install sam3
+
+    The model checkpoint is downloaded automatically from HuggingFace on
+    first use (authentication via ``huggingface-cli login`` may be required).
+
+    Args:
+        furniture_labels: Comma-separated list of furniture categories, e.g.
+            ``"sofa,chair,table,bed,cabinet,lamp"``.  Each label is used as
+            a text prompt; the resulting masks for all labels are merged
+            (bitwise OR) into a single inpainting mask per image.
+    """
+    try:
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+    except ImportError as exc:
+        raise ImportError(
+            "SAM 3 is required.  Install with:\n  pip install sam3"
+        ) from exc
+
+    labels = [lbl.strip() for lbl in furniture_labels.split(",") if lbl.strip()]
+    if not labels:
+        raise ValueError("furniture_labels must contain at least one label for SAM 3")
+
+    print("Loading SAM 3 (facebook/sam3) …")
+    model = build_sam3_image_model(device=device)
+    processor = Sam3Processor(model)
+
+    for img_path in tqdm(image_paths, desc="Masking (SAM 3)"):
+        image = Image.open(img_path).convert("RGB")
+        w, h = image.size
+
+        # Accumulate masks for every furniture label via text prompts
+        combined = np.zeros((h, w), dtype=np.uint8)
+        state = processor.set_image(image)
+
+        for label in labels:
+            output = processor.set_text_prompt(state=state, prompt=label)
+            masks = output.get("masks")
+            if masks is None:
+                continue
+            for m in masks:
+                mask_arr = np.asarray(m, dtype=bool)
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[0]
+                combined |= mask_arr.astype(np.uint8) * 255
+
+        # Always write the mask (empty = all-black when no furniture detected),
+        # so the resume logic won't reprocess this image on the next run.
+        cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), combined)
+
+
 def _mask_grounded_sam(
     image_paths: List[Path],
     masks_dir: Path,
@@ -791,11 +865,13 @@ def generate_masks(
 ) -> None:
     """Generate per-image furniture masks and save them to ``masks/``.
 
-    Four masking backends are available via the ``masker`` argument:
+    Five masking backends are available via the ``masker`` argument:
 
     * ``"sam"``          – Meta SAM ViT-H; automatic segments, centre heuristic.
                            Requires a local ``.pth`` checkpoint (``sam_checkpoint``).
     * ``"sam2"``         – Meta SAM 2; improved boundaries, no download needed.
+    * ``"sam3"``         – Meta SAM 3; text-prompted concept segmentation,
+                           no checkpoint download needed (auto from HuggingFace).
     * ``"grounded_sam"`` – GroundingDINO + SAM; text-prompted furniture detection
                            (most accurate for interior design – **recommended**).
     * ``"oneformer"``    – Panoptic segmentation on ADE20K 150 categories;
@@ -814,12 +890,12 @@ def generate_masks(
         stability_score_thresh: SAM stability score threshold.
         min_mask_region_area: Minimum mask area (pixels) to keep.
         furniture_labels: Comma-separated furniture categories for
-            ``"grounded_sam"``.
+            ``"grounded_sam"`` and ``"sam3"``.
         box_threshold: GroundingDINO box confidence threshold.
         text_threshold: GroundingDINO text probability threshold.
         target_labels: ADE20K category names to mask with ``"oneformer"``.
     """
-    _SUPPORTED = ("sam", "sam2", "grounded_sam", "oneformer")
+    _SUPPORTED = ("sam", "sam2", "sam3", "grounded_sam", "oneformer")
     if masker not in _SUPPORTED:
         raise ValueError(
             f"Unknown masker '{masker}'. Choose one of: {_SUPPORTED}"
@@ -857,6 +933,8 @@ def generate_masks(
             )
         elif masker == "sam2":
             _mask_sam2(paths, masks_dir, device, points_per_side, pred_iou_thresh)
+        elif masker == "sam3":
+            _mask_sam3(paths, masks_dir, device, furniture_labels)
         elif masker == "grounded_sam":
             _mask_grounded_sam(
                 paths, masks_dir, device, furniture_labels,
@@ -1039,16 +1117,17 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── mask ───────────────────────────────────────────────────────────────
     p_mask = sub.add_parser(
         "mask",
-        help="Auto-generate furniture masks (sam | sam2 | grounded_sam | oneformer)",
+        help="Auto-generate furniture masks (sam | sam2 | sam3 | grounded_sam | oneformer)",
     )
     p_mask.add_argument("--dataset_dir", required=True)
     p_mask.add_argument(
         "--masker",
         default="grounded_sam",
-        choices=["sam", "sam2", "grounded_sam", "oneformer"],
+        choices=["sam", "sam2", "sam3", "grounded_sam", "oneformer"],
         help=(
             "sam          – Meta SAM ViT-H, automatic mode, needs local .pth\n"
             "sam2         – Meta SAM 2, improved, no download needed\n"
+            "sam3         – Meta SAM 3, text-prompted concept segmentation\n"
             "grounded_sam – GroundingDINO+SAM, text-prompted [default, recommended]\n"
             "oneformer    – Panoptic segmentation on ADE20K 150 categories"
         ),

@@ -244,7 +244,7 @@ class TestGenerateMasksArgValidation:
             generate_masks(str(tiny_dataset), masker="magical_ai")
 
     def test_supported_maskers_accepted(self):
-        for name in ("sam", "sam2", "grounded_sam", "oneformer"):
+        for name in ("sam", "sam2", "sam3", "grounded_sam", "oneformer"):
             try:
                 generate_masks("/nonexistent", masker=name, splits=[])
             except (FileNotFoundError, RuntimeError, ImportError):
@@ -285,6 +285,12 @@ class TestGenerateMasksMocked:
     @patch("prepare_data._mask_sam2")
     def test_sam2_masks_dir_created(self, mock_fn, tiny_dataset):
         generate_masks(str(tiny_dataset), masker="sam2", splits=["train"])
+        assert (tiny_dataset / "train" / "masks").exists()
+        mock_fn.assert_called_once()
+
+    @patch("prepare_data._mask_sam3")
+    def test_sam3_masks_dir_created(self, mock_fn, tiny_dataset):
+        generate_masks(str(tiny_dataset), masker="sam3", splits=["train"])
         assert (tiny_dataset / "train" / "masks").exists()
         mock_fn.assert_called_once()
 
@@ -329,6 +335,20 @@ class TestGenerateMasksMocked:
         args, kwargs = call_kwargs
         passed_labels = kwargs.get("target_labels") or args[3]
         assert passed_labels == target
+
+    @patch("prepare_data._mask_sam3")
+    def test_sam3_receives_furniture_labels(self, mock_fn, tiny_dataset):
+        custom_labels = "sofa,chair,table"
+        generate_masks(
+            str(tiny_dataset),
+            masker="sam3",
+            splits=["train"],
+            furniture_labels=custom_labels,
+        )
+        args, kwargs = mock_fn.call_args
+        # furniture_labels is the 4th positional arg (index 3): paths, masks_dir, device, furniture_labels
+        passed = kwargs.get("furniture_labels") or args[3]
+        assert passed == custom_labels
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +395,24 @@ class TestCLIParser:
             ["mask", "--dataset_dir", "data/interior", "--masker", "sam2"]
         )
         assert args.masker == "sam2"
+
+    def test_mask_sam3_selected(self):
+        parser = _build_parser()
+        args = parser.parse_args(
+            ["mask", "--dataset_dir", "data/interior", "--masker", "sam3"]
+        )
+        assert args.masker == "sam3"
+
+    def test_mask_sam3_with_labels(self):
+        parser = _build_parser()
+        args = parser.parse_args([
+            "mask",
+            "--dataset_dir", "data/interior",
+            "--masker", "sam3",
+            "--furniture_labels", "sofa,chair,table",
+        ])
+        assert args.masker == "sam3"
+        assert args.furniture_labels == "sofa,chair,table"
 
     def test_mask_oneformer_selected(self):
         parser = _build_parser()
