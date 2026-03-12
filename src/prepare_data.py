@@ -435,7 +435,7 @@ def _pick_best_mask(
 
     Returns:
         A ``(H, W)`` ``uint8`` mask with 0 / 255 values, or ``None`` when
-        *annotations* is empty.
+        *annotations* is empty or all masks are zero after combination.
     """
     if not annotations:
         return None
@@ -974,7 +974,7 @@ def validate_dataset(
         print(f"  Valid masks:      {valid_masks}")
         print(f"  Missing masks:    {len(missing_masks)}")
         print(f"  Empty masks:      {len(empty_masks)}")
-        print(f"  Small masks:      {len(small_masks)} (< {min_mask_area_frac:.1%} area)")
+        print(f"  Small masks:      {len(small_masks)} (< {min_mask_area_frac:.2%} area)")
         print(f"  Missing captions: {len(missing_captions)}")
         print(f"  Orphan captions:  {len(orphan_captions)}")
 
