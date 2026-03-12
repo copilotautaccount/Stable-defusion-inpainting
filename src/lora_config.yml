@@ -1,0 +1,102 @@
+# ─────────────────────────────────────────────────────────────────
+# DreamBooth LoRA – SDXL Inpainting  |  train_config.yaml
+# ─────────────────────────────────────────────────────────────────
+
+model:
+  pretrained_model_name_or_path: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+  # Optional: use a better VAE (e.g. madebyollin/sdxl-vae-fp16-fix)
+  pretrained_vae_model_name_or_path: null
+
+# ── DreamBooth-specific ──────────────────────────────────────────
+dreambooth:
+  instance_prompt: "photo of a sks interior room"   # trigger word
+  class_prompt:    "photo of an interior room"       # for prior preservation
+  class_data_dir:  "data/class_images"
+  num_class_images: 200
+  with_prior_preservation: true
+  prior_loss_weight: 1.0
+  train_text_encoder: false   # set true to also LoRA-tune both CLIP encoders
+
+# ── LoRA / DoRA ──────────────────────────────────────────────────
+lora:
+  enabled: true
+  rank: 16          # LoRA rank (4-64; higher = more capacity, more VRAM)
+  alpha: 16         # lora_alpha (usually equal to rank)
+  dropout: 0.0
+  use_dora: false   # DoRA (Weight-Decomposed LoRA) – needs peft >= 0.9.0
+
+# ── Data ─────────────────────────────────────────────────────────
+data:
+  instance_data_dir: "data/instance_images"   # your interior images
+  dataset_dir:       "data"                   # root for val split
+  val_split:         "val"                    # data/val/images + data/val/masks
+  mask_dir:          null                     # leave null → random box masks
+  mask_min_area:     0.10                     # 10% of image area
+  mask_max_area:     0.50                     # 50% of image area
+  image_size:        1024
+  center_crop:       false
+  random_flip:       true
+  num_workers:       4
+  repeats:           1                        # repeat each instance image N times
+
+# ── Training ─────────────────────────────────────────────────────
+training:
+  output_dir:                 "outputs/dreambooth-lora-sdxl-inpaint"
+  resolution:                 1024
+  train_batch_size:           1
+  sample_batch_size:          2               # for class image generation
+  gradient_accumulation_steps: 4
+  gradient_checkpointing:     true
+  mixed_precision:            "bf16"          # "no" | "fp16" | "bf16"
+  num_train_epochs:           100
+  max_train_steps:            null            # overrides num_train_epochs if set
+  checkpointing_steps:        500
+  checkpoints_total_limit:    3
+  resume_from_checkpoint:     null            # "latest" or path
+
+  # Optimiser
+  optimizer:           "adamw"               # "adamw" | "prodigy"
+  learning_rate:       1.0e-4
+  text_encoder_lr:     5.0e-6                # only used when train_text_encoder=true
+  lr_scheduler:        "cosine_with_restarts"
+  lr_warmup_steps:     100
+  lr_num_cycles:       1
+  lr_power:            1.0
+  adam_beta1:          0.9
+  adam_beta2:          0.999
+  adam_weight_decay:   1.0e-4
+  adam_epsilon:        1.0e-8
+  max_grad_norm:       1.0
+  use_8bit_adam:       false
+
+  # Advanced
+  enable_xformers:         false
+  do_edm_style_training:   false   # EDM formulation (Playground v2.5 style)
+  snr_gamma:               5.0     # Min-SNR rebalancing; null to disable
+  output_kohya_format:     false   # also export Kohya/A111/ComfyUI-compatible weights
+  seed:                    42
+
+  # Prodigy-specific (ignored for adamw)
+  prodigy_decouple:            true
+  prodigy_use_bias_correction: true
+  prodigy_safeguard_warmup:    true
+
+# ── Validation ───────────────────────────────────────────────────
+validation:
+  validation_prompts:
+    - "photo of a sks interior room, modern minimalist design, 4K"
+    - "photo of a sks interior room, cozy scandinavian style"
+  num_validation_images: 2
+  validation_steps:      500     # run validation every N optimizer steps
+
+# ── Logging ──────────────────────────────────────────────────────
+logging:
+  run_name:          "dreambooth-lora-sdxl-inpaint"
+  report_to:         "tensorboard"   # "tensorboard" | "wandb" | "none"
+  log_every_n_steps: 50
+
+# ── Push to Hub (optional) ────────────────────────────────────────
+push_to_hub:
+  enabled:       false
+  hub_model_id:  "your-username/dreambooth-lora-sdxl-inpaint"
+  hub_token:     null   # or set HF_TOKEN env var
