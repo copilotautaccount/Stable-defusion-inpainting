@@ -202,13 +202,23 @@ class InteriorInpaintingDataset(Dataset):
         return self.spatial_transform(img)
 
     def _load_mask(self, image_path: Path, size: Tuple[int, int]) -> np.ndarray:
-        """Return a (H, W) uint8 mask – 255 = region to inpaint."""
+        """Return a (H, W) uint8 mask – 255 = region to inpaint.
+
+        When a precomputed mask exists but is empty (all zeros) or covers less
+        than ``mask_min_area`` of the image, it is treated as unusable and a
+        random mask is generated instead.  This prevents training on samples
+        where the masking model failed to produce a meaningful region.
+        """
         if self.use_precomputed_masks:
             mask_path = self.masks_dir / (image_path.stem + ".png")
             if mask_path.exists():
                 m = np.array(Image.open(mask_path).convert("L").resize((size[1], size[0]), Image.NEAREST))
                 _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
-                return m
+                # Fall back to a random mask when the precomputed mask is
+                # empty or too small – this avoids training on meaningless
+                # all-black masks that SAM/SAM2 sometimes produce.
+                if np.mean(m > 0) >= self.mask_min_area:
+                    return m
         return generate_mask(
             size[0], size[1],
             mask_type=self.mask_type,

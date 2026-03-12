@@ -30,6 +30,7 @@ from prepare_data import (
     generate_captions,
     generate_masks,
     split_dataset,
+    validate_dataset,
     _build_parser,
     _image_paths,
 )
@@ -648,3 +649,224 @@ class TestFlorence2Loading:
 
         _, proc_kwargs = mock_processor_cls.from_pretrained.call_args
         assert proc_kwargs.get("trust_remote_code") is True
+
+
+# ---------------------------------------------------------------------------
+# _pick_best_mask – improved multi-mask combination
+# ---------------------------------------------------------------------------
+
+class TestPickBestMaskCombined:
+    """Tests for the improved _pick_best_mask that combines multiple masks."""
+
+    def _make_ann(
+        self, cx: int, cy: int, w: int = 20, h: int = 20, size: int = 64,
+        predicted_iou: float = 0.9,
+    ) -> dict:
+        seg = np.zeros((size, size), dtype=bool)
+        seg[cy : cy + h, cx : cx + w] = True
+        return {
+            "bbox": [cx, cy, w, h],
+            "segmentation": seg,
+            "predicted_iou": predicted_iou,
+            "area": int(np.sum(seg)),
+        }
+
+    def test_combines_multiple_masks(self):
+        """Multiple valid annotations should be OR-combined."""
+        ann1 = self._make_ann(10, 10, 15, 15)
+        ann2 = self._make_ann(40, 40, 15, 15)
+        result = _pick_best_mask([ann1, ann2], cx=32, cy=32)
+        assert result is not None
+        # Both regions should be present
+        assert result[15, 15] == 255
+        assert result[45, 45] == 255
+
+    def test_filters_tiny_segments(self):
+        """Segments smaller than min_area_frac should be filtered out."""
+        # Tiny segment: 2x2 = 4 pixels out of 64*64 = 4096 → 0.1%
+        tiny = self._make_ann(0, 0, 2, 2, size=64)
+        # Normal segment: 20x20 = 400 pixels → ~9.8%
+        normal = self._make_ann(20, 20, 20, 20, size=64)
+        result = _pick_best_mask(
+            [tiny, normal], cx=32, cy=32, min_area_frac=0.02,
+        )
+        assert result is not None
+        # Normal segment should be present
+        assert result[25, 25] == 255
+
+    def test_filters_huge_segments(self):
+        """Segments larger than max_area_frac should be filtered out."""
+        # Huge segment covering most of the image
+        huge = self._make_ann(0, 0, 60, 60, size=64)
+        # Normal segment
+        normal = self._make_ann(5, 5, 10, 10, size=64)
+        result = _pick_best_mask(
+            [huge, normal], cx=32, cy=32, max_area_frac=0.5,
+        )
+        assert result is not None
+        # Normal segment region should be present
+        assert result[8, 8] == 255
+
+    def test_prefers_high_iou(self):
+        """Annotations with higher predicted_iou should be preferred."""
+        low_iou = self._make_ann(10, 10, 10, 10, predicted_iou=0.5)
+        high_iou = self._make_ann(40, 40, 10, 10, predicted_iou=0.95)
+        result = _pick_best_mask([low_iou, high_iou], cx=32, cy=32)
+        assert result is not None
+        # Both should be included (we combine up to 5)
+        assert result[12, 12] == 255
+        assert result[42, 42] == 255
+
+    def test_returns_none_for_all_zero_after_combination(self):
+        """If all annotations produce zero masks, return None."""
+        ann = {
+            "bbox": [10, 10, 0, 0],
+            "segmentation": np.zeros((64, 64), dtype=bool),
+            "predicted_iou": 0.9,
+            "area": 0,
+        }
+        # All-zero segmentation after filtering falls back to original list,
+        # still all-zero → None
+        result = _pick_best_mask([ann], cx=32, cy=32)
+        assert result is None
+
+    def test_limits_to_five_masks(self):
+        """At most 5 annotations should be combined."""
+        anns = [self._make_ann(i * 8, i * 8, 5, 5, size=64, predicted_iou=0.9)
+                for i in range(8)]
+        result = _pick_best_mask(anns, cx=32, cy=32)
+        assert result is not None
+        # Count distinct masked regions
+        assert result.dtype == np.uint8
+
+    def test_fallback_when_all_filtered(self):
+        """When filtering removes everything, fall back to original list."""
+        # All annotations are tiny (below min_area_frac default of 0.01)
+        tiny = self._make_ann(30, 30, 1, 1, size=200)
+        result = _pick_best_mask([tiny], cx=100, cy=100)
+        assert result is not None  # Falls back, doesn't return None
+
+
+# ---------------------------------------------------------------------------
+# validate_dataset
+# ---------------------------------------------------------------------------
+
+class TestValidateDataset:
+    @pytest.fixture()
+    def dataset_with_masks(self, tmp_path):
+        """Dataset with images, masks (some empty), and captions."""
+        for split in ("train",):
+            img_dir = tmp_path / split / "images"
+            mask_dir = tmp_path / split / "masks"
+            img_dir.mkdir(parents=True)
+            mask_dir.mkdir(parents=True)
+
+            captions = {}
+            for i in range(4):
+                name = f"room_{i:03d}.png"
+                _make_random_image(img_dir / name)
+
+                if i == 0:
+                    # Valid mask
+                    m = np.zeros((64, 64), dtype=np.uint8)
+                    m[16:48, 16:48] = 255
+                    Image.fromarray(m).save(mask_dir / name)
+                elif i == 1:
+                    # Empty mask
+                    m = np.zeros((64, 64), dtype=np.uint8)
+                    Image.fromarray(m).save(mask_dir / name)
+                elif i == 2:
+                    # Missing mask (no file saved)
+                    pass
+                elif i == 3:
+                    # Small mask (< 1% area)
+                    m = np.zeros((64, 64), dtype=np.uint8)
+                    m[0, 0] = 255  # 1 pixel
+                    Image.fromarray(m).save(mask_dir / name)
+
+                captions[name] = f"Caption for room {i}"
+
+            # Add an orphan caption for a non-existent image
+            captions["ghost.png"] = "This image does not exist"
+
+            with open(tmp_path / split / "captions.json", "w") as fh:
+                json.dump(captions, fh)
+
+        return tmp_path
+
+    def test_detects_missing_masks(self, dataset_with_masks):
+        report = validate_dataset(str(dataset_with_masks), splits=["train"])
+        assert len(report["train"]["missing_masks"]) == 1
+        assert "room_002.png" in report["train"]["missing_masks"]
+
+    def test_detects_empty_masks(self, dataset_with_masks):
+        report = validate_dataset(str(dataset_with_masks), splits=["train"])
+        assert len(report["train"]["empty_masks"]) == 1
+        assert "room_001.png" in report["train"]["empty_masks"]
+
+    def test_detects_small_masks(self, dataset_with_masks):
+        report = validate_dataset(
+            str(dataset_with_masks), splits=["train"], min_mask_area_frac=0.01,
+        )
+        assert len(report["train"]["small_masks"]) == 1
+        assert "room_003.png" in report["train"]["small_masks"]
+
+    def test_detects_orphan_captions(self, dataset_with_masks):
+        report = validate_dataset(str(dataset_with_masks), splits=["train"])
+        assert "ghost.png" in report["train"]["orphan_captions"]
+
+    def test_valid_mask_count(self, dataset_with_masks):
+        report = validate_dataset(str(dataset_with_masks), splits=["train"])
+        assert report["train"]["valid_masks"] == 1
+
+    def test_remove_empty_deletes_files(self, dataset_with_masks):
+        masks_dir = dataset_with_masks / "train" / "masks"
+        assert (masks_dir / "room_001.png").exists()
+        validate_dataset(
+            str(dataset_with_masks), splits=["train"], remove_empty=True,
+        )
+        assert not (masks_dir / "room_001.png").exists()
+
+    def test_skips_missing_split(self, tmp_path):
+        report = validate_dataset(str(tmp_path), splits=["nonexistent"])
+        assert "nonexistent" not in report
+
+    def test_cli_validate_parser(self):
+        parser = _build_parser()
+        args = parser.parse_args([
+            "validate", "--dataset_dir", "data/interior", "--remove_empty",
+        ])
+        assert args.command == "validate"
+        assert args.remove_empty is True
+        assert args.min_mask_area_frac == 0.01
+
+
+# ---------------------------------------------------------------------------
+# Dataset empty-mask fallback
+# ---------------------------------------------------------------------------
+
+class TestDatasetEmptyMaskFallback:
+    """Verify that the dataset falls back to random masks for empty precomputed masks."""
+
+    def test_empty_mask_triggers_random_fallback(self, tmp_path):
+        """When a precomputed mask is all-black, dataset generates a random mask."""
+        img_dir = tmp_path / "train" / "images"
+        mask_dir = tmp_path / "train" / "masks"
+        img_dir.mkdir(parents=True)
+        mask_dir.mkdir(parents=True)
+
+        name = "room_000.png"
+        arr = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
+        Image.fromarray(arr).save(img_dir / name)
+        # Save an empty mask
+        Image.fromarray(np.zeros((256, 256), dtype=np.uint8)).save(mask_dir / name)
+
+        from dataset import InteriorInpaintingDataset
+
+        ds = InteriorInpaintingDataset(
+            dataset_dir=str(tmp_path), split="train", size=64,
+        )
+        sample = ds[0]
+        m = sample["mask"]
+        # The random mask should have SOME masked pixels
+        assert m.max() > 0, "Empty precomputed mask should trigger random fallback"

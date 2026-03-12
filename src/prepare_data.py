@@ -261,33 +261,37 @@ def _caption_florence2(
 ) -> dict:
     try:
         import torch
-        # Sử dụng Auto class để linh hoạt hơn
-        from transformers import AutoProcessor, AutoModelForCausalLM
+        from transformers import AutoProcessor
     except ImportError as exc:
         raise ImportError("pip install transformers torch einops timm") from exc
 
     model_id = "microsoft/Florence-2-large"
-    print(f"Loading Florence-2 (An toàn) từ {model_id} …")
+    print(f"Loading Florence-2 from {model_id} …")
 
-    _dtype = torch.float16 if device != "cuda" else torch.float32
+    _dtype = torch.float16 if device == "cuda" else torch.float32
 
-    # SỬA LỖI TẠI ĐÂY:
-    # Luôn sử dụng trust_remote_code=True cho cả Model và Processor 
-    # để đảm bảo chúng dùng chung kiến trúc "custom" từ HuggingFace, 
-    # tránh lỗi 'image_token' của bản native.
-    
+    # Processor always needs trust_remote_code=True to avoid the
+    # ``RobertaTokenizer has no attribute image_token`` crash.
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    
-    model_kwargs = _torch_dtype_kwarg(_dtype)
-    model_kwargs["trust_remote_code"] = True
-    
-    # Florence-2 chạy tốt nhất với Flash Attention nếu có, 
-    # nhưng "eager" là an toàn nhất cho mọi cấu hình.
-    model_kwargs["attn_implementation"] = "eager" 
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, **model_kwargs
-    ).to(device)
+    model_kwargs = _torch_dtype_kwarg(_dtype)
+    model_kwargs["attn_implementation"] = "eager"
+
+    # transformers >= 4.45 ships a native Florence2ForConditionalGeneration;
+    # passing trust_remote_code=True with the native class triggers an
+    # architecture-class mismatch crash.  Use it only on older versions where
+    # AutoModelForCausalLM + trust_remote_code is required.
+    if _transformers_version() >= (4, 45):
+        from transformers import Florence2ForConditionalGeneration
+        model = Florence2ForConditionalGeneration.from_pretrained(
+            model_id, **model_kwargs
+        ).to(device)
+    else:
+        from transformers import AutoModelForCausalLM
+        model_kwargs["trust_remote_code"] = True
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, **model_kwargs
+        ).to(device)
     model.eval()
 
     task_token = "<MORE_DETAILED_CAPTION>"
@@ -405,18 +409,70 @@ def generate_captions(
 # Masking backends
 # ---------------------------------------------------------------------------
 
-def _pick_best_mask(annotations: list, cx: int, cy: int) -> Optional[np.ndarray]:
-    """Return the SAM annotation mask whose bounding-box centre is closest
-    to (cx, cy) – a simple heuristic for the main furniture object."""
+def _pick_best_mask(
+    annotations: list,
+    cx: int,
+    cy: int,
+    min_area_frac: float = 0.01,
+    max_area_frac: float = 0.85,
+) -> Optional[np.ndarray]:
+    """Combine the top SAM annotation masks into a single inpainting mask.
+
+    Instead of returning only the single mask closest to the image centre,
+    this function merges all annotations whose area is between
+    ``min_area_frac`` and ``max_area_frac`` of the total image area. Very
+    small segments (noise) and very large segments (full-image background)
+    are discarded.  Among the remaining candidates the five with the
+    highest ``predicted_iou`` (falling back to centre-distance ranking when
+    IoU is unavailable) are combined via bitwise OR.
+
+    Args:
+        annotations: List of SAM annotation dicts (each has ``bbox``,
+            ``segmentation``, and optionally ``predicted_iou`` / ``area``).
+        cx, cy: Image centre coordinates used as a tie-breaker.
+        min_area_frac: Minimum segment area as a fraction of image area.
+        max_area_frac: Maximum segment area as a fraction of image area.
+
+    Returns:
+        A ``(H, W)`` ``uint8`` mask with 0 / 255 values, or ``None`` when
+        *annotations* is empty.
+    """
     if not annotations:
         return None
 
-    def dist(ann: dict) -> float:
-        x, y, bw, bh = ann["bbox"]
-        return (x + bw / 2 - cx) ** 2 + (y + bh / 2 - cy) ** 2
+    # Determine image dimensions from the first annotation's segmentation
+    seg0 = annotations[0]["segmentation"]
+    total_pixels = seg0.shape[0] * seg0.shape[1]
 
-    annotations.sort(key=dist)
-    return annotations[0]["segmentation"].astype(np.uint8) * 255
+    # Filter by area fraction to drop noise and full-background segments
+    filtered = []
+    for ann in annotations:
+        seg = ann["segmentation"]
+        area = int(ann.get("area", np.sum(seg)))
+        frac = area / total_pixels
+        if min_area_frac <= frac <= max_area_frac:
+            filtered.append(ann)
+
+    # Fall back to the original list when filtering removes everything
+    if not filtered:
+        filtered = annotations
+
+    # Rank candidates: prefer high predicted_iou, break ties by distance to centre
+    def score(ann: dict) -> tuple:
+        iou = ann.get("predicted_iou", 0.0)
+        x, y, bw, bh = ann["bbox"]
+        dist_sq = (x + bw / 2 - cx) ** 2 + (y + bh / 2 - cy) ** 2
+        # Higher iou first (negate for ascending sort), then closer to centre
+        return (-iou, dist_sq)
+
+    filtered.sort(key=score)
+
+    # Combine up to 5 top candidates
+    combined = np.zeros_like(seg0, dtype=np.uint8)
+    for ann in filtered[:5]:
+        combined |= ann["segmentation"].astype(np.uint8) * 255
+
+    return combined if np.any(combined) else None
 
 
 def _mask_sam(
@@ -813,6 +869,131 @@ def generate_masks(
 
 
 # ---------------------------------------------------------------------------
+# Dataset validation
+# ---------------------------------------------------------------------------
+
+def validate_dataset(
+    dataset_dir: str,
+    splits: Optional[List[str]] = None,
+    min_mask_area_frac: float = 0.01,
+    remove_empty: bool = False,
+) -> dict:
+    """Validate a prepared dataset and report quality statistics.
+
+    Checks every split for:
+
+    * images without a corresponding mask file,
+    * masks that are empty or below ``min_mask_area_frac``,
+    * images without a caption entry in ``captions.json``,
+    * captions that reference non-existent images.
+
+    When ``remove_empty`` is *True* empty/too-small mask files are deleted so
+    that the masking step can be re-run for those images (the resume logic
+    skips images whose mask already exists).
+
+    Args:
+        dataset_dir: Root dataset directory.
+        splits: Splits to validate (default: ``["train", "val"]``).
+        min_mask_area_frac: Minimum fraction of non-zero pixels for a mask
+            to be considered valid.
+        remove_empty: If *True*, delete mask files that are empty or below
+            the area threshold so they can be re-generated.
+
+    Returns:
+        A dict mapping each split to its validation summary.
+    """
+    splits = splits if splits is not None else ["train", "val"]
+    root = Path(dataset_dir)
+    report: dict = {}
+
+    for split in splits:
+        images_dir = root / split / "images"
+        masks_dir = root / split / "masks"
+        captions_path = root / split / "captions.json"
+
+        if not images_dir.exists():
+            print(f"  [{split}] Skipping – images directory not found.")
+            continue
+
+        image_files = _image_paths(images_dir)
+        image_names = {p.name for p in image_files}
+        image_stems = {p.stem for p in image_files}
+
+        # --- Masks ----------------------------------------------------------
+        missing_masks: List[str] = []
+        empty_masks: List[str] = []
+        small_masks: List[str] = []
+        valid_masks = 0
+
+        if masks_dir.exists():
+            for img in image_files:
+                mask_path = masks_dir / (img.stem + ".png")
+                if not mask_path.exists():
+                    missing_masks.append(img.name)
+                    continue
+                m = np.array(Image.open(mask_path).convert("L"))
+                area_frac = np.mean(m > 127)
+                if area_frac == 0:
+                    empty_masks.append(img.name)
+                elif area_frac < min_mask_area_frac:
+                    small_masks.append(img.name)
+                else:
+                    valid_masks += 1
+        else:
+            missing_masks = [p.name for p in image_files]
+
+        # --- Captions -------------------------------------------------------
+        captions: dict = {}
+        if captions_path.exists():
+            with open(captions_path, "r", encoding="utf-8") as fh:
+                captions = json.load(fh)
+
+        missing_captions = [
+            name for name in image_names
+            if name not in captions and name.rsplit(".", 1)[0] not in captions
+        ]
+        orphan_captions = [
+            k for k in captions
+            if k not in image_names and k not in image_stems
+        ]
+
+        # --- Report ---------------------------------------------------------
+        summary = {
+            "total_images": len(image_files),
+            "valid_masks": valid_masks,
+            "missing_masks": missing_masks,
+            "empty_masks": empty_masks,
+            "small_masks": small_masks,
+            "missing_captions": missing_captions,
+            "orphan_captions": orphan_captions,
+        }
+        report[split] = summary
+
+        print(f"\n[{split}] Validation summary")
+        print(f"  Images:           {len(image_files)}")
+        print(f"  Valid masks:      {valid_masks}")
+        print(f"  Missing masks:    {len(missing_masks)}")
+        print(f"  Empty masks:      {len(empty_masks)}")
+        print(f"  Small masks:      {len(small_masks)} (< {min_mask_area_frac:.1%} area)")
+        print(f"  Missing captions: {len(missing_captions)}")
+        print(f"  Orphan captions:  {len(orphan_captions)}")
+
+        # --- Optional cleanup -----------------------------------------------
+        if remove_empty and masks_dir.exists():
+            removed = 0
+            for name in empty_masks + small_masks:
+                stem = name.rsplit(".", 1)[0]
+                mask_file = masks_dir / (stem + ".png")
+                if mask_file.exists():
+                    mask_file.unlink()
+                    removed += 1
+            if removed:
+                print(f"  Removed {removed} empty/small mask files for re-generation.")
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -897,6 +1078,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mask.add_argument("--box_threshold", type=float, default=0.35)
     p_mask.add_argument("--text_threshold", type=float, default=0.25)
 
+    # ── validate ──────────────────────────────────────────────────────────
+    p_val = sub.add_parser(
+        "validate",
+        help="Validate dataset quality: check masks, captions, report issues",
+    )
+    p_val.add_argument("--dataset_dir", required=True)
+    p_val.add_argument("--splits", nargs="+", default=["train", "val"])
+    p_val.add_argument(
+        "--min_mask_area_frac",
+        type=float,
+        default=0.01,
+        help="Minimum fraction of non-zero pixels for a mask to be valid (default: 0.01)",
+    )
+    p_val.add_argument(
+        "--remove_empty",
+        action="store_true",
+        help="Delete empty/small mask files so they can be re-generated",
+    )
+
     return parser
 
 
@@ -935,6 +1135,14 @@ def main() -> None:
             furniture_labels=args.furniture_labels,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
+        )
+
+    elif args.command == "validate":
+        validate_dataset(
+            dataset_dir=args.dataset_dir,
+            splits=args.splits,
+            min_mask_area_frac=args.min_mask_area_frac,
+            remove_empty=args.remove_empty,
         )
 
 
