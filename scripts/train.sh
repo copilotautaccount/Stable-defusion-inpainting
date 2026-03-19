@@ -3,11 +3,11 @@
 # train.sh – Launch fine-tuning (single GPU or multi-GPU)
 #
 # Usage:
-#   # Single GPU  (runs inside tmux so it survives SSH disconnect)
+#   # Multi-GPU 4 GPUs (default)
 #   bash scripts/train.sh
 #
-#   # Multi-GPU (4 GPUs)
-#   NUM_GPUS=4 bash scripts/train.sh
+#   # Single GPU
+#   NUM_GPUS=1 bash scripts/train.sh
 #
 #   # Skip tmux (run in current shell)
 #   NO_TMUX=1 bash scripts/train.sh
@@ -20,14 +20,25 @@
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# ── Ensure we run with the correct conda environment ─────────
+CONDA_BASE="${CONDA_BASE:-/home/diffusion/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-base}"
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+fi
+
 CONFIG="${CONFIG:-configs/train_config.yaml}"
-NUM_GPUS="${NUM_GPUS:-1}"
+# Default: use all 4 GPUs
+NUM_GPUS="${NUM_GPUS:-4}"
 PYTHON=${PYTHON:-python3}
 TMUX_SESSION="${TMUX_SESSION:-sd-train}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_config.yaml}"
 
 # ── Compose the actual training command ──────────────────────
 if [ "$NUM_GPUS" -gt 1 ]; then
-    TRAIN_CMD="accelerate launch --num_processes $NUM_GPUS --mixed_precision fp16 src/train.py --config $CONFIG"
+    TRAIN_CMD="accelerate launch --config_file $ACCELERATE_CONFIG --num_processes $NUM_GPUS src/train.py --config $CONFIG"
 else
     TRAIN_CMD="$PYTHON src/train.py --config $CONFIG"
 fi

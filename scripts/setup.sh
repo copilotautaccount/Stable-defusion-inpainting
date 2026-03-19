@@ -7,9 +7,28 @@ set -euo pipefail
 
 PYTHON=${PYTHON:-python3}
 
+# ── Redirect pip tmp/cache to the large data partition ─────────────────────
+# The root filesystem (/) is small (~8 GB); NVIDIA wheels are huge (several GB).
+# Storing pip downloads + temp files on /home/diffusion avoids "No space left"
+# errors on root-mounted /tmp.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/home/diffusion/.cache/pip}"
+export TMPDIR="${TMPDIR:-/home/diffusion/tmp_pip}"
+mkdir -p "$TMPDIR"
+
+# ── Skip install if key packages already present ────────────────────────────
+if $PYTHON -c "import torch, diffusers, accelerate, peft" 2>/dev/null; then
+    echo "=== Key packages already installed – skipping full install ==="
+    echo "    (Set FORCE_INSTALL=1 to reinstall anyway)"
+    if [ "${FORCE_INSTALL:-0}" != "1" ]; then
+        echo ""
+        echo "Setup complete (skipped)."
+        exit 0
+    fi
+fi
+
 echo "=== Installing Python dependencies ==="
 $PYTHON -m pip install --upgrade pip
-$PYTHON -m pip install -r requirements.txt
+$PYTHON -m pip install --no-cache-dir -r requirements.txt
 
 # Install PyTorch with CUDA 11.8 (adjust the index URL for your CUDA version)
 # Comment out if you already have the correct torch installed.

@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────
-# Fine-tuning configuration for Stable Diffusion
+# Fine-tuning configuration for Stable Diffusion XL
 # Inpainting on Interior-Design dataset
+# Two-stage LoRA Training
 # ─────────────────────────────────────────────
 
 model:
-  pretrained_model_name_or_path: "runwayml/stable-diffusion-inpainting"
-  # Alternative: "stabilityai/stable-diffusion-2-inpainting"
+  pretrained_model_name_or_path: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
   revision: null
   variant: null
 
@@ -29,7 +29,7 @@ data:
   dataset_dir: "data/interior"          # root directory of processed dataset
   train_split: "train"
   val_split: "val"
-  image_size: 512                        # training resolution (512 or 768)
+  image_size: 1024                       # SDXL native resolution
   center_crop: false
   random_flip: true
   mask_type: "mixed"   # "bbox" | "irregular" | "object" | "mixed"
@@ -40,28 +40,77 @@ data:
   default_caption: "A high-quality interior design photo"
   num_workers: 4
 
+# ── Two-stage training config ────────────────────────────────────────────────
+# Stage 1: noise MSE loss only  →  builds a solid denoising foundation
+# Stage 2: resume from stage-1 checkpoint with full perceptual multi-loss
+two_stage:
+  enabled: true
+
+  stage1:
+    output_dir: "outputs/interior-inpainting-sdxl/stage1"
+    num_train_epochs: 30
+    max_train_steps: null
+    checkpointing_steps: 500
+    resume_from_checkpoint: "latest"   # set to "latest" or path to resume stage1
+    learning_rate: 1.0e-5
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 500
+
+  stage2:
+    output_dir: "outputs/interior-inpainting-sdxl/stage2"
+    # Path to stage-1 LoRA weights to initialise from.
+    # Set to "auto" to automatically use the last stage-1 checkpoint.
+    stage1_lora_path: "auto"
+    num_train_epochs: 20
+    max_train_steps: null
+    checkpointing_steps: 500
+
+    resume_from_checkpoint: "latest"
+    learning_rate: 1.5e-6      # effective LR = 1.5e-6 × (alpha/rank=2) = 3e-6, much lower than stage1's 1e-5
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 1500      # ~9% of 16040 steps – critical for multi-loss stability
+    # Per-stage optimizer overrides (fall back to training.* if not set)
+    adam_beta2: 0.9999         # slower variance EMA → more stable with noisy multi-loss gradients
+    max_grad_norm: 0.5         # tighter clip to dampen loss spikes from aux losses
+    snr_gamma: 5.0             # Min-SNR weighting: high/low timesteps contribute equally
+    # Loss weights – calibrated from OBSERVED raw loss scales (Stage-2 charts):
+    #   noise_mse ~2.3 | pixel ~6.2 | perceptual ~32 | boundary ~12 | depth ~3100 | semantic ~22
+    # Target proportions: noise_mse ~40% | perceptual ~20% | depth/pixel/semantic ~10% each | boundary ~5%
+    loss_weights:
+      noise_mse:  1.000     # primary diffusion objective  (~40%)
+      pixel:      0.090     # latent-space L1              (~10%)
+      perceptual: 0.035     # VGG texture matching         (~20%)
+      clip:       0.000     # disabled (saves VRAM)
+      boundary:   0.020     # Sobel edge sharpness         ( ~5%)
+      depth:      0.0002    # MiDaS depth consistency      (~11%)
+      semantic:   0.025     # DeepLab layout consistency   (~10%)
+    # Skip aux losses for timesteps >= t_max_aux (x0_pred is unreliable at high noise).
+    # At t=600/1000, 1/sqrt(alpha_t) ≈ 4x amplification → stringent enough.
+    t_max_aux: 600
+
 training:
-  output_dir: "outputs/interior-inpainting"
+  # Shared / stage-agnostic settings
+  output_dir: "outputs/interior-inpainting-sdxl"   # top-level; stages go in sub-dirs
   seed: 42
-  resolution: 512
+  resolution: 1024
   train_batch_size: 2
-  gradient_accumulation_steps: 4        # effective batch = 2 × 4 = 8
-  num_train_epochs: 50
-  max_train_steps: null                  # if set, overrides num_train_epochs
+  gradient_accumulation_steps: 2        # effective batch = 2 × 2 × 4 GPUs = 16
+  num_train_epochs: 30                   # used only when two_stage.enabled = false
+  max_train_steps: null
   checkpointing_steps: 500
-  resume_from_checkpoint: "latest"      # path or "latest"
-  learning_rate: 1.0e-4
+  resume_from_checkpoint: null
+  learning_rate: 1.0e-5
   lr_scheduler: "cosine"
-  lr_warmup_steps: 200
+  lr_warmup_steps: 500
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 0.01
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-  mixed_precision: "fp16"               # "no" | "fp16" | "bf16"
+  mixed_precision: "bf16"               # SDXL works best with bf16
   gradient_checkpointing: true          # saves VRAM at slight speed cost
   use_8bit_adam: false                  # requires bitsandbytes
-  enable_xformers: true
+  enable_xformers: false                # xformers may not support SDXL UNet on all setups
 
 validation:
   validation_steps: 500
@@ -75,7 +124,7 @@ validation:
 
 logging:
   report_to: "wandb"   # "wandb" | "tensorboard" | "none"
-  run_name: "sd-inpainting-interior-lora"
+  run_name: "sdxl-inpainting-interior-lora"
   log_every_n_steps: 50
 
 push_to_hub:

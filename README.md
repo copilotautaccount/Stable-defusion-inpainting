@@ -172,9 +172,61 @@ SKIP_INSTALL=1 SKIP_SPLIT=1 SKIP_CAPTION=1 SKIP_MASK=1 SKIP_ACCELERATE=1 \
     bash scripts/run_pipeline.sh
 ```
 
-### Step-by-step (manual)
+### Step-by-step manual – `data/interior_v2`
 
-If you prefer to run each step individually:
+Dùng các lệnh dưới đây để chạy từng bước trực tiếp trên thư mục `data/interior_v2`
+(images đã được split sẵn, chỉ cần chạy caption → mask → train):
+
+```bash
+# ── Bước 1: Sinh captions (Florence-2, ~8 GB VRAM) ───────────
+python src/prepare_data.py caption \
+    --dataset_dir data/interior_v2 \
+    --captioner   florence2 \
+    --device      cuda
+
+# ── Bước 2: Sinh masks (Grounded-SAM, ~10 GB VRAM) ──────────
+python src/prepare_data.py mask \
+    --dataset_dir      data/interior_v2 \
+    --masker           grounded_sam \
+    --sam_checkpoint   checkpoints/sam_vit_h_4b8939.pth \
+    --furniture_labels "sofa,armchair,chair,dining chair,table,coffee table,bed,wardrobe,cabinet,lamp,floor lamp,curtain,rug,mirror" \
+    --device           cuda
+
+# ── Bước 3: Cấu hình accelerate (chạy 1 lần / máy) ──────────
+accelerate config
+
+# ── Bước 4: Train SDXL – Stage 1 (noise MSE only) ────────────
+python src/train.py \
+    --config configs/train_config.yaml \
+    --stage  1
+
+# ── Bước 5: Train SDXL – Stage 2 (multi-loss từ Stage 1) ─────
+python src/train.py \
+    --config configs/train_config.yaml \
+    --stage  2
+
+# ── Bước 6: Inference (tuỳ chọn) ────────────────────────────
+python src/inference.py \
+    --model_dir outputs/interior-inpainting-sdxl/stage2 \
+    --lora_dir  outputs/interior-inpainting-sdxl/stage2/unet_lora \
+    --image     data/interior_v2/val/images/<tên_ảnh>.jpg \
+    --mask      data/interior_v2/val/masks/<tên_ảnh>.png \
+    --prompt    "a modern living room with a white linen sofa" \
+    --output    outputs/inference_results/result.png
+```
+
+> **Chạy nhanh toàn bộ pipeline cho `interior_v2`:**
+> ```bash
+> DATASET_DIR=data/interior_v2 \
+> SKIP_SPLIT=1 \
+> SKIP_INSTALL=1 \
+> bash scripts/run_pipeline.sh
+> ```
+> `SKIP_SPLIT=1` vì `interior_v2` đã có sẵn thư mục `train/` và `val/`.
+
+### Step-by-step (manual – generic)
+
+If you prefer to run each step individually with a custom dataset:
 
 ```bash
 # ── Step 1: Install ───────────────────────────────────────────
@@ -183,37 +235,40 @@ bash scripts/setup.sh
 # ── Step 2: Split raw images ──────────────────────────────────
 python src/prepare_data.py split \
     --source_dir data/raw \
-    --output_dir data/interior \
+    --output_dir data/interior_v2 \
     --val_ratio  0.1
 
 # ── Step 3: Generate captions ─────────────────────────────────
 # Pick ONE of: blip (6 GB) | florence2 (8 GB, recommended) | blip2 (15 GB)
 python src/prepare_data.py caption \
-    --dataset_dir data/interior \
+    --dataset_dir data/interior_v2 \
     --captioner   florence2 \
     --device      cuda
 
 # ── Step 4: Generate masks ────────────────────────────────────
 # Pick ONE of: grounded_sam (recommended) | oneformer | sam2 | sam
 python src/prepare_data.py mask \
-    --dataset_dir      data/interior \
+    --dataset_dir      data/interior_v2 \
     --masker           grounded_sam \
     --sam_checkpoint   checkpoints/sam_vit_h_4b8939.pth \
-    --furniture_labels "sofa,chair,table,bed,cabinet,lamp" \
+    --furniture_labels "sofa,armchair,chair,dining chair,table,coffee table,bed,wardrobe,cabinet,lamp,floor lamp,curtain,rug,mirror" \
     --device           cuda
 
 # ── Step 5: Configure accelerate (once per machine) ───────────
 accelerate config
 
-# ── Step 6: Fine-tune ─────────────────────────────────────────
-bash scripts/train.sh
-# or: python src/train.py --config configs/train_config.yaml
+# ── Step 6a: Train – Stage 1 (SDXL LoRA, noise MSE only) ─────
+python src/train.py --config configs/train_config.yaml --stage 1
+
+# ── Step 6b: Train – Stage 2 (multi-loss từ Stage 1) ─────────
+python src/train.py --config configs/train_config.yaml --stage 2
 
 # ── Step 7: Inference (optional) ──────────────────────────────
 python src/inference.py \
-    --model_dir outputs/interior-inpainting \
-    --image     data/interior/val/images/room_001.jpg \
-    --mask      data/interior/val/masks/room_001.png \
+    --model_dir outputs/interior-inpainting-sdxl/stage2 \
+    --lora_dir  outputs/interior-inpainting-sdxl/stage2/unet_lora \
+    --image     data/interior_v2/val/images/room_001.jpg \
+    --mask      data/interior_v2/val/masks/room_001.png \
     --prompt    "a modern living room with a white linen sofa" \
     --output    results/result.png
 ```

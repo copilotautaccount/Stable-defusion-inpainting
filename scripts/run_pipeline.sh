@@ -27,6 +27,8 @@ set -euo pipefail
 # Re-launch the entire pipeline inside a tmux session so it survives SSH
 # disconnects and laptop sleep.  Skip with NO_TMUX=1.
 TMUX_SESSION="${TMUX_SESSION:-sd-pipeline}"
+LOG_FILE="${LOG_FILE:-$(pwd)/pipeline.log}"
+
 if [ "${NO_TMUX:-0}" != "1" ] && [ -z "${TMUX:-}" ]; then
     if command -v tmux &>/dev/null; then
         if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -38,18 +40,61 @@ if [ "${NO_TMUX:-0}" != "1" ] && [ -z "${TMUX:-}" ]; then
         echo "=== Launching full pipeline inside tmux session '$TMUX_SESSION' ==="
         echo "    All stages will continue even if SSH disconnects or laptop sleeps."
         echo ""
-        echo "  Attach later  : tmux attach -t $TMUX_SESSION"
+        echo "  Attach later     : tmux attach -t $TMUX_SESSION"
         echo "  Detach (keep running): Ctrl+B then D"
+        echo "  Live log         : tail -f $LOG_FILE"
         echo ""
-        # Pass all original env vars + NO_TMUX=1 so the re-spawned script skips this block
-        tmux new-session -d -s "$TMUX_SESSION" \
-            "cd $(pwd) && NO_TMUX=1 bash scripts/run_pipeline.sh $(printf '%q ' "$@"); echo ''; echo '=== Pipeline finished. Press any key to close ==='; read -n1"
+        # Write the inner runner to a temp script to avoid all quoting pitfalls
+        # (inline bash -c '...' breaks when the command itself contains single quotes).
+        _wrapper=$(mktemp /tmp/sd-pipeline-XXXX.sh)
+        cat > "$_wrapper" <<WRAPPER_EOF
+#!/bin/bash
+cd $(pwd)
+NO_TMUX=1 bash scripts/run_pipeline.sh $(printf '%q ' "$@") 2>&1 | tee "$LOG_FILE"
+_rc=\${PIPESTATUS[0]}
+echo ''
+if [ "\$_rc" != '0' ]; then
+    echo ''
+    echo '╔══════════════════════════════════════════╗'
+    printf  '║  !! PIPELINE FAILED  (exit code %s)      ║\n' "\$_rc"
+    echo '╚══════════════════════════════════════════╝'
+    echo ''
+    echo "  Full log : $LOG_FILE"
+    echo "  To inspect: tail -200 $LOG_FILE"
+else
+    echo '=== Pipeline finished successfully ==='
+fi
+echo ''
+echo 'Press Enter to close (window auto-closes in 30 min)...'
+read -t 1800 _key || true
+rm -f "$_wrapper"
+WRAPPER_EOF
+        chmod +x "$_wrapper"
+        tmux new-session -d -s "$TMUX_SESSION" "bash '$_wrapper'"
         tmux attach -t "$TMUX_SESSION"
         exit 0
     else
         echo "WARNING: tmux not found – running in current shell (will stop on SSH disconnect)."
     fi
 fi
+
+# ── Error trap (runs inside tmux / NO_TMUX mode) ───────────────────────────
+# Prints the failing command + line number so the cause is always visible.
+_on_error() {
+    local _code=$?
+    local _cmd="${BASH_COMMAND}"
+    local _line="${BASH_LINENO[0]}"
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  !! ERROR – pipeline stopped !!                              ║"
+    printf "║  Line %-55s║\n" "$_line"
+    printf "║  Cmd : %-55s║\n" "${_cmd:0:55}"
+    printf "║  Exit: %-55s║\n" "$_code"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "  Tip: scroll up (or check pipeline.log) to see the full error output."
+}
+trap '_on_error' ERR
 # ───────────────────────────────────────────────────────────────────────────
 
 # ── Configuration ──────────────────────────────────────────────────────────
@@ -70,8 +115,12 @@ SEED="${SEED:-42}"
 # Captioner  →  blip (6 GB) | florence2 (8 GB) | blip2 (15 GB)
 CAPTIONER="${CAPTIONER:-florence2}"
 
-# Masker     →  grounded_sam (recommended) | oneformer | sam2 | sam
+# Masker     →  grounded_sam (default) | sam3 | oneformer | sam2 | sam
+#   sam3 requires HuggingFace access approval: https://huggingface.co/facebook/sam3
+#   Once approved: huggingface-cli login  then  MASKER=sam3 bash scripts/run_pipeline.sh
 MASKER="${MASKER:-grounded_sam}"
+# Maximum fraction of image area a mask may cover (0.0–1.0)
+MAX_MASK_RATIO="${MAX_MASK_RATIO:-0.70}"
 SAM_CHECKPOINT="${SAM_CHECKPOINT:-checkpoints/sam_vit_h_4b8939.pth}"
 FURNITURE_LABELS="${FURNITURE_LABELS:-sofa,armchair,chair,dining chair,table,coffee table,bed,wardrobe,cabinet,lamp,floor lamp,curtain,rug,mirror}"
 
@@ -80,6 +129,17 @@ INFERENCE_IMAGE="${INFERENCE_IMAGE:-}"          # also set this and INFERENCE_MA
 INFERENCE_MASK="${INFERENCE_MASK:-}"
 INFERENCE_PROMPT="${INFERENCE_PROMPT:-a modern living room with a white linen sofa}"
 INFERENCE_OUTPUT="${INFERENCE_OUTPUT:-results/result.png}"
+
+# ── Conda environment ─────────────────────────────────────────────────────
+# Activate conda 'base' which already has torch/accelerate/diffusers/peft.
+# Override with CONDA_ENV=myenv or PYTHON=/path/to/python if needed.
+CONDA_BASE="${CONDA_BASE:-/home/diffusion/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-base}"
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ] && [ -z "${CONDA_DEFAULT_ENV:-}" ]; then
+    # shellcheck disable=SC1091
+    . "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+fi
 
 PYTHON="${PYTHON:-python3}"
 # ── End of Configuration ───────────────────────────────────────────────────
@@ -110,6 +170,7 @@ echo "  Python  : $($PYTHON --version)"
 echo "  Device  : $DEVICE"
 echo "  Captioner: $CAPTIONER"
 echo "  Masker  : $MASKER"
+echo "  Max mask: ${MAX_MASK_RATIO} (fraction of image area)"
 echo ""
 echo "  Source images : $SOURCE_DIR"
 echo "  Dataset dir   : $DATASET_DIR"
@@ -187,7 +248,8 @@ _header "STAGE 4 – Generate masks  (src/prepare_data.py mask --masker $MASKER)
 #  Output: $DATASET_DIR/{train,val}/masks/   (*.png, white = region to inpaint)
 #
 #  Masker options:
-#    grounded_sam  →  GroundingDINO + SAM, text-prompted     (~10 GB) ← default / recommended
+#    sam3          →  Meta SAM 3, text-prompted               (~10 GB) ← default
+#    grounded_sam  →  GroundingDINO + SAM, text-prompted     (~10 GB)
 #    oneformer     →  panoptic segmentation (ADE20K 150 cls) (~12 GB)
 #    sam2          →  Meta SAM 2, HuggingFace, no download   (~8 GB)
 #    sam           →  Meta SAM v1, needs local .pth           (~7 GB)
@@ -208,6 +270,7 @@ else
             --dataset_dir    "$DATASET_DIR" \
             --masker         sam \
             --sam_checkpoint "$SAM_CHECKPOINT" \
+            --max_mask_ratio "$MAX_MASK_RATIO" \
             --device         "$DEVICE"
         ;;
       grounded_sam)
@@ -223,16 +286,26 @@ else
             --masker           grounded_sam \
             --sam_checkpoint   "$SAM_CHECKPOINT" \
             --furniture_labels "$FURNITURE_LABELS" \
+            --max_mask_ratio   "$MAX_MASK_RATIO" \
+            --device           "$DEVICE"
+        ;;
+      sam3)
+        $PYTHON src/prepare_data.py mask \
+            --dataset_dir      "$DATASET_DIR" \
+            --masker           sam3 \
+            --furniture_labels "$FURNITURE_LABELS" \
+            --max_mask_ratio   "$MAX_MASK_RATIO" \
             --device           "$DEVICE"
         ;;
       sam2|oneformer)
         $PYTHON src/prepare_data.py mask \
-            --dataset_dir "$DATASET_DIR" \
-            --masker      "$MASKER" \
-            --device      "$DEVICE"
+            --dataset_dir    "$DATASET_DIR" \
+            --masker         "$MASKER" \
+            --max_mask_ratio "$MAX_MASK_RATIO" \
+            --device         "$DEVICE"
         ;;
       *)
-        echo "ERROR: Unknown MASKER='$MASKER'. Valid options: sam | sam2 | grounded_sam | oneformer"
+        echo "ERROR: Unknown MASKER='$MASKER'. Valid options: sam | sam2 | sam3 | grounded_sam | oneformer"
         exit 1
         ;;
     esac

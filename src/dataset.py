@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -131,7 +132,10 @@ class InteriorInpaintingDataset(Dataset):
         pixel_values   – (3, H, W) float32, range [-1, 1]  – original image
         masked_image   – (3, H, W) float32, range [-1, 1]  – image ⊙ (1-mask)
         mask           – (1, H, W) float32, range [0, 1]   – 1 = inpaint area
-        input_ids      – (77,) int64                       – tokenised caption
+        input_ids      – (77,) int64  – tokenised caption (legacy SD 1.x only;
+                          pass tokenizer=None for SDXL which uses dual encoders)
+        caption        – str          – raw caption text (always present;
+                          used by SDXL dual-tokeniser encoding in train.py)
     """
 
     def __init__(
@@ -179,7 +183,11 @@ class InteriorInpaintingDataset(Dataset):
         self.captions: Dict[str, str] = {}
         if self.captions_path.exists():
             with open(self.captions_path, "r", encoding="utf-8") as fh:
-                self.captions = json.load(fh)
+                raw = json.load(fh)
+            # Strip tokenizer padding/special-token artefacts (e.g. <pad>) that
+            # may have been left by BLIP / BLIP-2 batch decoding.
+            _special = re.compile(r"(<pad>|</s>|<s>|<unk>|<sep>|<bos>|<eos>)+", re.IGNORECASE)
+            self.captions = {k: _special.sub(" ", v).strip() for k, v in raw.items()}
 
         # Image transforms (no normalisation yet – applied later)
         resize_crop: List[Callable] = [transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)]

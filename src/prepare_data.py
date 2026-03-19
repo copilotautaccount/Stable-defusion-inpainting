@@ -63,6 +63,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional
@@ -93,6 +94,16 @@ _ADE20K_FURNITURE_IDS = {
     "curtain", "rug", "mat", "ottoman", "bench", "stool",
     "television", "monitor", "refrigerator",
 }
+
+
+# Regex matching tokenizer special-token artefacts that leak into decoded text
+# when batched generation is used with padding (e.g. BLIP, BLIP-2).
+_SPECIAL_TOKEN_RE = re.compile(r"(<pad>|</s>|<s>|<unk>|<sep>|<bos>|<eos>)+", re.IGNORECASE)
+
+
+def _clean_caption(text: str) -> str:
+    """Remove tokenizer padding/special-token artefacts from a decoded caption."""
+    return _SPECIAL_TOKEN_RE.sub(" ", text).strip()
 
 
 def _image_paths(images_dir: Path) -> List[Path]:
@@ -214,7 +225,9 @@ def _caption_blip(
         with torch.no_grad():
             ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
         for path, out_ids in zip(batch, ids):
-            captions[path.name] = processor.decode(out_ids, skip_special_tokens=True).strip()
+            captions[path.name] = _clean_caption(
+                processor.decode(out_ids, skip_special_tokens=True)
+            )
 
     return captions
 
@@ -255,7 +268,9 @@ def _caption_blip2(
         with torch.no_grad():
             ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
         for path, out_ids in zip(batch, ids):
-            captions[path.name] = processor.decode(out_ids, skip_special_tokens=True).strip()
+            captions[path.name] = _clean_caption(
+                processor.decode(out_ids, skip_special_tokens=True)
+            )
 
     return captions
 
@@ -280,62 +295,75 @@ def _caption_florence2(
     # ``RobertaTokenizer has no attribute image_token`` crash.
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-    model_kwargs = _torch_dtype_kwarg(_dtype)
-    model_kwargs["attn_implementation"] = "eager"
-
-    # transformers >= 4.45 ships a native Florence2ForConditionalGeneration;
-    # passing trust_remote_code=True with the native class triggers an
-    # architecture-class mismatch crash.  Use it only on older versions where
-    # AutoModelForCausalLM + trust_remote_code is required.
-    if _transformers_version() >= (4, 45):
-        from transformers import Florence2ForConditionalGeneration
-        model = Florence2ForConditionalGeneration.from_pretrained(
-            model_id, **model_kwargs
-        ).to(device)
-    else:
-        from transformers import AutoModelForCausalLM
-        model_kwargs["trust_remote_code"] = True
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, **model_kwargs
-        ).to(device)
+    # Florence-2 is always loaded via trust_remote_code=True; there is no
+    # native Florence2ForConditionalGeneration class in the transformers package.
+    # Always use `torch_dtype` (not `dtype`) because the remote custom __init__
+    # does not accept the newer `dtype` kwarg introduced in transformers >= 4.48.
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=_dtype,
+        attn_implementation="eager",
+        trust_remote_code=True,
+    ).to(device)
     model.eval()
 
     task_token = "<MORE_DETAILED_CAPTION>"
     captions: dict = {}
 
+    skipped: list = []
+
     for i in tqdm(range(0, len(image_paths), batch_size), desc="Captioning (Florence-2)"):
-        batch = image_paths[i : i + batch_size]
-        images = [Image.open(p).convert("RGB") for p in batch]
-        
+        raw_batch = image_paths[i : i + batch_size]
+
+        # Load images, skipping any that PIL cannot read (corrupt / truncated files)
+        valid_paths: list = []
+        valid_images: list = []
+        for p in raw_batch:
+            try:
+                img = Image.open(p).convert("RGB")
+                img.load()          # force full decode so truncated files surface here
+                valid_paths.append(p)
+                valid_images.append(img)
+            except Exception as exc:
+                print(f"\n  WARNING: skipping unreadable image {p.name}: {exc}")
+                skipped.append(p)
+
+        if not valid_paths:
+            continue
+
         inputs = processor(
-            text=[task_token] * len(images),
-            images=images,
+            text=[task_token] * len(valid_images),
+            images=valid_images,
             return_tensors="pt",
             padding=True,
         )
-        
-        # Chuyển dữ liệu sang GPU/CPU
-        inputs = {k: v.to(device).to(_dtype) if v.dtype == torch.float32 else v.to(device) 
-                 for k, v in inputs.items() if isinstance(v, torch.Tensor)}
-        
+
+        # Move tensors to device / dtype
+        inputs = {k: v.to(device).to(_dtype) if v.dtype == torch.float32 else v.to(device)
+                  for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+
         with torch.no_grad():
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
                 max_new_tokens=1024,
-                num_beams=3
+                num_beams=3,
             )
-            
-        for path, out_ids, image in zip(batch, generated_ids, images):
+
+        for path, out_ids, image in zip(valid_paths, generated_ids, valid_images):
             generated_text = processor.batch_decode(out_ids.unsqueeze(0), skip_special_tokens=False)[0]
-            
-            # Post-process để lấy nội dung text sạch
             parsed_answer = processor.post_process_generation(
                 generated_text,
                 task=task_token,
-                image_size=(image.width, image.height)
+                image_size=(image.width, image.height),
             )
-            captions[path.name] = parsed_answer[task_token]
+            captions[path.name] = _clean_caption(parsed_answer[task_token])
+
+    if skipped:
+        print(f"\n  Skipped {len(skipped)} unreadable image(s):")
+        for p in skipped:
+            print(f"    {p}")
 
     return captions
 
@@ -620,15 +648,86 @@ def _mask_sam3(
         from sam3.model.sam3_image_processor import Sam3Processor
     except ImportError as exc:
         raise ImportError(
-            "SAM 3 is required.  Install with:\n  pip install sam3"
+            "SAM 3 is not installed.  Install it with:\n"
+            "  pip install sam3\n"
+            "or follow https://github.com/facebookresearch/sam3 for source install.\n"
+            "Alternatively use '--masker grounded_sam' which relies only on "
+            "groundingdino-py + segment-anything."
         ) from exc
 
     labels = [lbl.strip() for lbl in furniture_labels.split(",") if lbl.strip()]
     if not labels:
         raise ValueError("furniture_labels must contain at least one label for SAM 3")
 
+    # ── Resolve the BPE vocab file ──────────────────────────────────────────
+    # sam3's model_builder defaults to  <sam3_package>/../assets/bpe_simple_vocab_16e6.txt.gz
+    # which resolves to  site-packages/assets/  – a directory that is NOT created
+    # by the sam3 installer.  We locate the file from other known locations and,
+    # if still not found, download it so the user never has to intervene manually.
+    import importlib.util as _ilu
+    import urllib.request as _urlreq
+
+    _BPE_FNAME = "bpe_simple_vocab_16e6.txt.gz"
+    _BPE_URL = "https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz"
+
+    def _find_bpe() -> str:
+        # 1. sam3's expected location (may already be fixed by user / installer)
+        _sam3_dir = Path(_ilu.find_spec("sam3").origin).parent
+        candidate = _sam3_dir.parent / "assets" / _BPE_FNAME
+        if candidate.exists():
+            return str(candidate)
+        # 2. open_clip package (ships the same file)
+        for _pkg in ("open_clip", "clip"):
+            spec = _ilu.find_spec(_pkg)
+            if spec is not None:
+                c = Path(spec.origin).parent / _BPE_FNAME
+                if c.exists():
+                    return str(c)
+        # 3. Project checkpoints/ directory
+        c = Path(__file__).parent.parent / "checkpoints" / _BPE_FNAME
+        if c.exists():
+            return str(c)
+        # 4. Download to checkpoints/ as a last resort
+        c.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  BPE vocab not found locally – downloading to {c} …")
+        _urlreq.urlretrieve(_BPE_URL, c)
+        print("  Download complete.")
+        # Also mirror to sam3's expected path so future runs don't need to download
+        _expected = _sam3_dir.parent / "assets" / _BPE_FNAME
+        try:
+            _expected.parent.mkdir(parents=True, exist_ok=True)
+            import shutil as _sh
+            _sh.copy2(str(c), str(_expected))
+        except OSError:
+            pass  # non-fatal; checkpoints/ copy is sufficient
+        return str(c)
+
+    _bpe_path = _find_bpe()
+    print(f"  BPE vocab: {_bpe_path}")
+
     print("Loading SAM 3 (facebook/sam3) …")
-    model = build_sam3_image_model(device=device)
+    try:
+        model = build_sam3_image_model(device=device, bpe_path=_bpe_path)
+    except Exception as _exc:
+        _msg = str(_exc)
+        if "GatedRepo" in type(_exc).__name__ or "403" in _msg or "gated" in _msg.lower() or "not in the authorized list" in _msg:
+            raise RuntimeError(
+                "\n"
+                "╔═══════════════════════════════════════════════════════════╗\n"
+                "║  facebook/sam3 is a GATED model – access not granted yet  ║\n"
+                "╚═══════════════════════════════════════════════════════════╝\n"
+                "\n"
+                "Steps to fix:\n"
+                "  1. Request access at  https://huggingface.co/facebook/sam3\n"
+                "     (click 'Agree and access repository')\n"
+                "  2. After approval, login:\n"
+                "       huggingface-cli login\n"
+                "  3. Re-run the pipeline.\n"
+                "\n"
+                "Alternatively, switch to grounded_sam (already installed, same quality):\n"
+                "  MASKER=grounded_sam bash scripts/run_pipeline.sh\n"
+            ) from _exc
+        raise
     processor = Sam3Processor(model)
 
     for img_path in tqdm(image_paths, desc="Masking (SAM 3)"):
@@ -656,6 +755,71 @@ def _mask_sam3(
         # Always write the mask (empty = all-black when no furniture detected),
         # so the resume logic won't reprocess this image on the next run.
         cv2.imwrite(str(masks_dir / (img_path.stem + ".png")), combined)
+
+
+def _apply_max_mask_ratio(
+    masks_dir: Path,
+    image_paths: List[Path],
+    max_ratio: float,
+) -> None:
+    """Post-process written masks so that no mask covers more than *max_ratio* of
+    the image area.
+
+    When a mask's white-pixel fraction exceeds *max_ratio*, the function keeps
+    only the largest connected components (sorted by area, descending) that fit
+    within the budget.  Any excess components are discarded.  If even the single
+    largest component exceeds the budget, the mask is zeroed out entirely.
+
+    Args:
+        masks_dir:   Directory where mask PNGs have already been written.
+        image_paths: The image paths processed in this run (used to derive mask names).
+        max_ratio:   Maximum allowed fraction of white pixels (e.g. 0.70 for 70%).
+    """
+    if max_ratio >= 1.0:
+        return  # no-op: no cap requested
+
+    clipped_count = 0
+    for img_path in image_paths:
+        mask_path = masks_dir / (img_path.stem + ".png")
+        if not mask_path.exists():
+            continue
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+
+        h, w = mask.shape
+        total_pixels = h * w
+        white_pixels = int(np.count_nonzero(mask))
+        if white_pixels / total_pixels <= max_ratio:
+            continue  # already within budget – skip
+
+        # Decompose into connected components and greedily keep the largest
+        # ones until the budget is exhausted.
+        binary = (mask > 127).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        # Build list of (area, label_id) excluding background (label 0)
+        component_areas = [
+            (int(stats[i, cv2.CC_STAT_AREA]), i)
+            for i in range(1, num_labels)
+        ]
+        component_areas.sort(reverse=True)
+
+        budget = int(total_pixels * max_ratio)
+        clipped = np.zeros_like(binary)
+        filled = 0
+        for area, label_id in component_areas:
+            if filled + area > budget:
+                break
+            clipped[labels == label_id] = 1
+            filled += area
+
+        cv2.imwrite(str(mask_path), (clipped * 255).astype(np.uint8))
+        clipped_count += 1
+
+    if clipped_count:
+        print(f"  Clipped {clipped_count} mask(s) that exceeded {max_ratio:.0%} coverage.")
 
 
 def _mask_grounded_sam(
@@ -865,6 +1029,8 @@ def generate_masks(
     text_threshold: float = 0.25,
     # OneFormer specific
     target_labels: Optional[List[str]] = None,
+    # Mask coverage cap
+    max_mask_ratio: float = 0.70,
 ) -> None:
     """Generate per-image furniture masks and save them to ``masks/``.
 
@@ -897,6 +1063,9 @@ def generate_masks(
         box_threshold: GroundingDINO box confidence threshold.
         text_threshold: GroundingDINO text probability threshold.
         target_labels: ADE20K category names to mask with ``"oneformer"``.
+        max_mask_ratio: Maximum fraction of image pixels the mask may cover
+            (default 0.70 = 70%).  Masks exceeding this threshold are clipped
+            by discarding the smallest connected components.
     """
     _SUPPORTED = ("sam", "sam2", "sam3", "grounded_sam", "oneformer")
     if masker not in _SUPPORTED:
@@ -946,6 +1115,7 @@ def generate_masks(
         elif masker == "oneformer":
             _mask_oneformer(paths, masks_dir, device, target_labels)
 
+        _apply_max_mask_ratio(masks_dir, paths, max_mask_ratio)
         print(f"  Saved masks → {masks_dir}")
 
 
@@ -1159,6 +1329,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_mask.add_argument("--box_threshold", type=float, default=0.35)
     p_mask.add_argument("--text_threshold", type=float, default=0.25)
+    # SAM specific
+    p_mask.add_argument("--stability_score_thresh", type=float, default=0.92,
+                        help="SAM stability score threshold (sam only, default: 0.92)")
+    p_mask.add_argument("--min_mask_region_area", type=int, default=2000,
+                        help="Minimum mask area in pixels (sam only, default: 2000)")
+    # Mask coverage cap
+    p_mask.add_argument(
+        "--max_mask_ratio",
+        type=float,
+        default=0.70,
+        help=(
+            "Maximum fraction of image area the mask may cover (default: 0.70 = 70%%). "
+            "Masks exceeding this are clipped by removing the smallest connected components."
+        ),
+    )
 
     # ── validate ──────────────────────────────────────────────────────────
     p_val = sub.add_parser(
@@ -1214,9 +1399,12 @@ def main() -> None:
             model_type=args.model_type,
             points_per_side=args.points_per_side,
             pred_iou_thresh=args.pred_iou_thresh,
+            stability_score_thresh=args.stability_score_thresh,
+            min_mask_region_area=args.min_mask_region_area,
             furniture_labels=args.furniture_labels,
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
+            max_mask_ratio=args.max_mask_ratio,
         )
 
     elif args.command == "validate":
