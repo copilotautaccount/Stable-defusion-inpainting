@@ -106,7 +106,8 @@ def compute_clip_score(
 ) -> float:
     """CLIP image–text cosine similarity (higher is better)."""
     inputs = clip_processor(
-        text=[prompt], images=img, return_tensors="pt", padding=True
+        text=[prompt], images=img, return_tensors="pt", padding=True,
+        truncation=True, max_length=77,
     ).to(device)
     with torch.no_grad():
         out = clip_model(**inputs)
@@ -219,7 +220,7 @@ def _inference_pass(
     """Run inference for all images and save results to out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
     device = args.device
-    dtype  = torch.bfloat16 if "cuda" in device else torch.float32
+    dtype  = torch.float16 if "cuda" in device else torch.float32
     is_sdxl = _is_sdxl(model_id)
 
     label = "Fine-tuned" if lora_dir else "Base"
